@@ -57,6 +57,41 @@ def save_user_settings():
         except Exception as e:
             logger.error(f"Failed to save user settings: {e}")
 
+# Generation & Spending History Tracking
+history_lock = threading.Lock()
+HISTORY_FILE = "generation_history.json"
+generation_history = []
+
+def load_history():
+    global generation_history
+    with history_lock:
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    generation_history = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load generation history: {e}")
+
+def log_generation_event(user_id: int, user_name: str, model_key: str, model_name: str, prompt: str, duration: str, status: str, media_url: str = None):
+    with history_lock:
+        event = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "user_id": user_id,
+            "user_name": user_name,
+            "model_key": model_key,
+            "model_name": model_name,
+            "prompt": prompt,
+            "duration": duration,
+            "status": status,
+            "media_url": media_url
+        }
+        generation_history.append(event)
+        try:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(generation_history[-100:], f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save generation history: {e}")
+
 def get_user_config(user_id: int) -> Dict[str, Any]:
     with settings_lock:
         if user_id not in user_settings:
@@ -333,6 +368,28 @@ if bot:
             bot.send_message(msg.chat.id, f"✅ User ID `{new_id}` added to authorized team whitelist!")
         else:
             bot.send_message(msg.chat.id, f"ℹ️ User ID `{new_id}` is already in the whitelist.")
+
+    @bot.message_handler(commands=["usage", "history"])
+    def cmd_usage(msg: Message):
+        if not check_access(msg): return
+        load_history()
+        with history_lock:
+            if not generation_history:
+                bot.send_message(msg.chat.id, "📊 *No generation history recorded yet.*\nStart generating videos to log usage!")
+                return
+            
+            total_jobs = len(generation_history)
+            recent = generation_history[-8:]
+            
+            history_text = f"📊 *Team Generation & Spending Log ({total_jobs} Total Jobs)*\n\n*Recent Generations:*\n"
+            for item in reversed(recent):
+                status_icon = "✅" if item.get("status") == "success" else "❌"
+                clean_p = escape_markdown(item.get("prompt", ""))[:40]
+                clean_m = escape_markdown(item.get("model_name", ""))
+                clean_u = escape_markdown(item.get("user_name", str(item.get("user_id"))))
+                history_text += f"{status_icon} *{clean_m}* ({item.get('duration')}s) — ID: `{clean_u}`\n  └ `\"{clean_p}...\"` [{item.get('timestamp')}]\n"
+            
+            bot.send_message(msg.chat.id, history_text)
 
     @bot.message_handler(commands=["listusers"])
     def cmd_listusers(msg: Message):
@@ -631,6 +688,7 @@ def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: 
         state, media_url, err = kie_client.poll_task_status(task_id, endpoint_type)
 
         if state == "success" and media_url:
+            log_generation_event(user_id, str(user_id), model_key, model_info['name'], prompt, cfg['duration'], "success", media_url)
             safe_edit_message_text(f"🎉 *Video Generation Complete!* [{elapsed}s]\nDownloading & sending MP4 video...", chat_id, msg_id)
             
             # Send video directly into Telegram chat with size handling
@@ -678,6 +736,7 @@ def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: 
             break
 
         elif state == "failed":
+            log_generation_event(user_id, str(user_id), model_key, model_info['name'], prompt, cfg['duration'], "failed")
             clean_err = escape_markdown(str(err or 'Task was rejected or encountered upstream error.'))
             safe_edit_message_text(
                 f"❌ *Video Generation Failed*\n\n`{clean_err}`\n\n"
