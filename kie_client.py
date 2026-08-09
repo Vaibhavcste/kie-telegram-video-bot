@@ -26,20 +26,17 @@ class KIEApiClient:
             return False, {"error": str(e)}
 
     def upload_image(self, file_bytes: bytes, filename: str = "image.png") -> Tuple[bool, str]:
-        """Upload image to KIE API and return public URL"""
-        url = f"{self.base_url}/upload/file-base64-upload"
+        """Upload image to KIE API (/api/v1/upload) using multipart form and return public URL"""
+        url = f"{self.base_url}/api/v1/upload"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
-            b64_str = base64.b64encode(file_bytes).decode('utf-8')
-            payload = {
-                "base64Data": f"data:image/png;base64,{b64_str}",
-                "filename": filename
-            }
-            res = requests.post(url, headers=self.headers, json=payload, timeout=30)
+            files = {"file": (filename, file_bytes, "image/png")}
+            res = requests.post(url, headers=headers, files=files, timeout=30)
             if res.status_code == 200:
                 data = res.json()
-                if "url" in data:
+                if "url" in data and data["url"].startswith("http"):
                     return True, data["url"]
-                elif "data" in data and "url" in data["data"]:
+                elif "data" in data and isinstance(data["data"], dict) and "url" in data["data"]:
                     return True, data["data"]["url"]
                 return True, str(data)
             return False, f"Upload failed: HTTP {res.status_code} - {res.text}"
