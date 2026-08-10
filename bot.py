@@ -412,12 +412,12 @@ if bot:
         current_model = cfg["model"]
         model_info = MODELS.get(current_model, MODELS["grok"])
 
-        # Auto-switch to an Image-to-Video compatible model if current model doesn't support images
+        # Determine target model for Image-to-Video without overwriting user's default setting
+        target_model = current_model
         notice_prefix = ""
         if not model_info.get("supports_image"):
-            cfg["model"] = "seedance2"
-            save_user_settings()
-            notice_prefix = "ℹ️ *Notice:* Photos require an Image-to-Video model. Automatically switched provider to *ByteDance Seedance 2.0*!\n\n"
+            target_model = "seedance2"
+            notice_prefix = "ℹ️ *Notice:* Photos require an Image-to-Video model. Generating photo animation using *ByteDance Seedance 2.0* (your default active model remains unchanged).\n\n"
 
         status_msg = bot.send_message(chat_id, f"{notice_prefix}📤 *Uploading photo to API...*")
         try:
@@ -430,7 +430,7 @@ if bot:
                 return
 
             safe_edit_message_text("✅ *Photo uploaded! Launching Image-to-Video generation...*", chat_id, status_msg.message_id)
-            handle_generation_request(chat_id, user_id, caption, image_url=img_url, status_msg_id=status_msg.message_id)
+            handle_generation_request(chat_id, user_id, caption, image_url=img_url, status_msg_id=status_msg.message_id, override_model=target_model)
         except Exception as e:
             bot.send_message(chat_id, f"❌ Error handling photo: {escape_markdown(str(e))}")
 
@@ -586,9 +586,9 @@ if bot:
 
 
 # ASYNCHRONOUS GENERATION & POLLING ENGINE
-def handle_generation_request(chat_id: int, user_id: int, prompt: str, image_url: str = None, status_msg_id: int = None):
+def handle_generation_request(chat_id: int, user_id: int, prompt: str, image_url: str = None, status_msg_id: int = None, override_model: Optional[str] = None):
     cfg = get_user_config(user_id)
-    model_key = cfg["model"]
+    model_key = override_model if override_model else cfg["model"]
     model_info = MODELS.get(model_key, MODELS["grok"])
 
     clean_prompt = escape_markdown(prompt)
@@ -641,9 +641,18 @@ def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: 
     )
 
     if not ok:
-        err_msg = escape_markdown(str(result.get("error", "Unknown error")))
+        raw_err = str(result.get("error", "Unknown error"))
+        if "Credits insufficient" in raw_err or "402" in raw_err:
+            err_msg = (
+                "💳 *API Wallet Top-Up Required*\n\n"
+                "The KIE API backend reported insufficient credits allocated for this model.\n"
+                "Please top up your API Token credits at `https://kie.abhibots.com/`."
+            )
+        else:
+            err_msg = f"`{escape_markdown(raw_err)}`"
+
         safe_edit_message_text(
-            f"❌ *Task Submission Failed*\n\n`{err_msg}`\n\n_Note: You were NOT charged for this request._",
+            f"❌ *Task Submission Failed*\n\n{err_msg}\n\n_Note: You were NOT charged for this request._",
             chat_id, msg_id
         )
         return
