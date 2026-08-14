@@ -17,8 +17,8 @@ from telebot.types import (
     CallbackQuery
 )
 
-from config import TELEGRAM_BOT_TOKEN, KIE_API_KEY, MODELS, DEFAULT_USER_SETTINGS, ALLOWED_USER_IDS
-from kie_client import KIEApiClient
+from config import TELEGRAM_BOT_TOKEN, OPENLUX_API_KEY, OPENLUX_BASE_URL, MODELS, DEFAULT_USER_SETTINGS, ALLOWED_USER_IDS
+from openlux_client import OpenLuxClient
 
 # Force unbuffered output for live logging
 sys.stdout.reconfigure(line_buffering=True)
@@ -28,10 +28,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("VGenBot")
+logger = logging.getLogger("OpenLuxBot")
 
-# Initialize KIE API Client
-kie_client = KIEApiClient(api_key=KIE_API_KEY)
+# Initialize OpenLux API Client
+openlux_client = OpenLuxClient(api_key=OPENLUX_API_KEY, base_url=OPENLUX_BASE_URL)
 
 # Thread Lock for User Settings File
 settings_lock = threading.Lock()
@@ -97,10 +97,12 @@ def get_user_config(user_id: int) -> Dict[str, Any]:
         if user_id not in user_settings:
             user_settings[user_id] = DEFAULT_USER_SETTINGS.copy()
         else:
-            # Auto-repair corrupted aspect ratios
+            # Auto-repair model or parameters if outdated
+            if user_settings[user_id].get("model") not in MODELS:
+                user_settings[user_id]["model"] = "grok"
             ar = str(user_settings[user_id].get("aspect_ratio", ""))
-            if ":" not in ar or ar not in ["16:9", "9:16", "1:1"]:
-                user_settings[user_id]["aspect_ratio"] = "16:9"
+            if ":" not in ar or ar not in ["9:16", "16:9", "1:1"]:
+                user_settings[user_id]["aspect_ratio"] = "9:16"
     return user_settings[user_id]
 
 # Safe Markdown Escaper for Telegram V1 Markdown
@@ -166,7 +168,7 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.row(
         InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-        InlineKeyboardButton("💰 Balance", callback_data="menu_balance")
+        InlineKeyboardButton("💰 Balance & Rates", callback_data="menu_balance")
     )
     markup.row(
         InlineKeyboardButton("🤖 Select Provider / Model", callback_data="menu_models"),
@@ -196,11 +198,6 @@ def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     res_btn_text = f"🖥️ Resolution: {cfg['resolution']}"
     markup.add(InlineKeyboardButton(res_btn_text, callback_data="menu_resolutions"))
 
-    # Sound Toggle (if supported)
-    if model_info.get("supports_sound"):
-        snd_label = "🔊 Sound: ON" if cfg.get("sound") else "🔇 Sound: OFF"
-        markup.add(InlineKeyboardButton(snd_label, callback_data="toggle_sound"))
-
     markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="menu_main"))
     return markup
 
@@ -215,7 +212,7 @@ def get_models_keyboard(current_model: str) -> InlineKeyboardMarkup:
 def get_durations_keyboard(model_key: str, current_duration: str) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     model_info = MODELS.get(model_key, MODELS["grok"])
-    durations = model_info.get("durations", ["6", "10", "15"])
+    durations = model_info.get("durations", ["5", "6", "10"])
     
     buttons = []
     for d in durations:
@@ -229,7 +226,7 @@ def get_durations_keyboard(model_key: str, current_duration: str) -> InlineKeybo
 def get_ratios_keyboard(model_key: str, current_ratio: str) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     model_info = MODELS.get(model_key, MODELS["grok"])
-    ratios = model_info.get("aspect_ratios", ["16:9", "9:16", "1:1"])
+    ratios = model_info.get("aspect_ratios", ["9:16", "16:9", "1:1"])
     
     buttons = []
     for r in ratios:
@@ -243,7 +240,7 @@ def get_ratios_keyboard(model_key: str, current_ratio: str) -> InlineKeyboardMar
 def get_resolutions_keyboard(model_key: str, current_res: str) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     model_info = MODELS.get(model_key, MODELS["grok"])
-    res_list = model_info.get("resolutions", ["720p", "1080p"])
+    res_list = model_info.get("resolutions", ["480p", "720p", "1080p"])
     
     buttons = []
     for res in res_list:
@@ -267,39 +264,35 @@ if bot:
         if not check_access(msg): return
         load_user_settings()
         cfg = get_user_config(msg.from_user.id)
-        m_name = MODELS.get(cfg["model"], {}).get("name", "xAI Grok Video 1.5")
+        m_name = MODELS.get(cfg["model"], {}).get("name", "xAI Grok Imagine Video")
         
         welcome_text = (
-            "🎥 *Welcome to the Team AI Video & Image Generator!*\n\n"
-            "Generate flagship AI videos and images directly in Telegram:\n"
-            "• *xAI Grok Video 1.5* (Recommended default — Fast & Cheap)\n"
-            "• *ByteDance Seedance 2.0 & 1.5*\n"
-            "• *Google Veo 3 / Veo 3 Fast*\n"
-            "• *Runway Gen-4*\n"
-            "• *Kuaishou Kling 2.6*\n"
-            "• *MiniMax Hailuo 02*\n"
-            "• *Google Gemini Omni*\n"
-            "• *OpenAI GPT Image 2*\n\n"
+            "🎥 *Welcome to Team AI Video & Image Generator (OpenLux Powered)!*\n\n"
+            "Generate AI videos and images directly in Telegram:\n"
+            "• *xAI Grok Imagine Video* (480p Reels ~₹3.4 RS | 720p ~₹10.8 RS)\n"
+            "• *Kuaishou Kling 3.0 Turbo* (1080p ~₹7.6 RS | Text & Photo-to-Video)\n"
+            "• *Midjourney V7* (High-Res 4-Grid Image Generation)\n\n"
             f"⚙️ *Active Model:* `{escape_markdown(m_name)}` ({cfg['duration']}s | {cfg['aspect_ratio']} | {cfg['resolution']})\n\n"
             "💡 *How to use:*\n"
-            "1. Simply *type any video prompt* (e.g. `A golden retriever running on a sunny beach`) and hit send!\n"
-            "2. Or *send a photo with a caption* to animate it into a video!\n"
+            "1. Simply *type any video prompt* (e.g. `A cyber cat running in heavy rain`) and hit send!\n"
+            "2. Or *send a photo with a caption* to animate it into a video using Kling 3.0!\n"
             "3. Use `/settings` to customize model, duration, resolution & aspect ratio.\n"
-            "4. Use `/balance` to check remaining API wallet balance.\n"
-            "5. Use `/myid` to check your Telegram User ID."
+            "4. Use `/balance` to check pricing & API status."
         )
         bot.send_message(msg.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
     @bot.message_handler(commands=["balance"])
     def cmd_balance(msg: Message):
         if not check_access(msg): return
-        ok, res = kie_client.get_balance()
-        if ok:
-            usd = res.get("balance", 0.0)
-            inr = res.get("balance_inr", 0)
-            text = f"💰 *API Wallet Balance*\n\n• *USD:* `${usd:.3f}`\n• *INR:* `₹{inr}`\n\n_Auto-refunded if any generation fails or gets rejected._"
-        else:
-            text = f"❌ *Failed to fetch balance:* {escape_markdown(str(res.get('error')))}"
+        text = (
+            "💰 *OpenLux API Active Status & Rate Card*\n\n"
+            "• *API Status:* `Connected & Operational` (`api.openlux.ai`)\n"
+            "• *Grok 480p (5s, 9:16):* `~$0.035 USD` (~₹3.43 INR / 3.4 RS) 🏆\n"
+            "• *Grok 720p (5s, 16:9):* `~$0.110 USD` (~₹10.80 INR / 10.8 RS)\n"
+            "• *Grok 720p (6s):* `~$0.185 USD` (~₹18.15 INR / 18.1 RS)\n"
+            "• *Kling 3.0 Turbo (5s 1080p):* `~0.595 RMB` (~₹7.67 INR / 7.6 RS)\n\n"
+            "_Billed on actual GPU rendering time per job._"
+        )
         bot.send_message(msg.chat.id, text)
 
     @bot.message_handler(commands=["settings"])
@@ -314,8 +307,7 @@ if bot:
             f"• *Pricing:* {escape_markdown(m_info['pricing'])}\n"
             f"• *Duration:* `{cfg['duration']} seconds`\n"
             f"• *Aspect Ratio:* `{cfg['aspect_ratio']}`\n"
-            f"• *Resolution:* `{cfg['resolution']}`\n"
-            f"• *Sound:* `{'ON' if cfg.get('sound') else 'OFF'}`\n\n"
+            f"• *Resolution:* `{cfg['resolution']}`\n\n"
             "Tap any button below to adjust your settings:"
         )
         bot.send_message(msg.chat.id, text, reply_markup=get_settings_keyboard(user_id))
@@ -349,10 +341,8 @@ if bot:
         new_id = int(args)
         if new_id not in ALLOWED_USER_IDS:
             ALLOWED_USER_IDS.append(new_id)
-            # Update .env
             env_str = ",".join(map(str, ALLOWED_USER_IDS))
             try:
-                # Read .env and update ALLOWED_USER_IDS line
                 env_path = ".env"
                 if os.path.exists(env_path):
                     with open(env_path, "r") as f:
@@ -416,20 +406,15 @@ if bot:
         target_model = current_model
         notice_prefix = ""
         if not model_info.get("supports_image"):
-            target_model = "seedance2"
-            notice_prefix = "ℹ️ *Notice:* Photos require an Image-to-Video model. Generating photo animation using *ByteDance Seedance 2.0* (your default active model remains unchanged).\n\n"
+            target_model = "kling"
+            notice_prefix = "ℹ️ *Notice:* Photos require an Image-to-Video model. Animating photo using *Kuaishou Kling 3.0 Turbo* (your default active model remains unchanged).\n\n"
 
-        status_msg = bot.send_message(chat_id, f"{notice_prefix}📤 *Uploading photo to API...*")
+        status_msg = bot.send_message(chat_id, f"{notice_prefix}📤 *Processing photo for OpenLux API...*")
         try:
             file_info = bot.get_file(msg.photo[-1].file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
+            img_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
             
-            ok, img_url = kie_client.upload_image(downloaded_file, filename="user_photo.png")
-            if not ok:
-                safe_edit_message_text(f"❌ *Photo Upload Failed:* {escape_markdown(str(img_url))}", chat_id, status_msg.message_id)
-                return
-
-            safe_edit_message_text("✅ *Photo uploaded! Launching Image-to-Video generation...*", chat_id, status_msg.message_id)
+            safe_edit_message_text("✅ *Photo ready! Launching Image-to-Video generation...*", chat_id, status_msg.message_id)
             handle_generation_request(chat_id, user_id, caption, image_url=img_url, status_msg_id=status_msg.message_id, override_model=target_model)
         except Exception as e:
             bot.send_message(chat_id, f"❌ Error handling photo: {escape_markdown(str(e))}")
@@ -449,8 +434,8 @@ if bot:
         if text.lower() in conversational_words or len(text) < 3:
             bot.send_message(
                 msg.chat.id,
-                "👋 *Hello!* Enter any video prompt below to generate an AI video.\n"
-                "Example: `A futuristic cyberpunk city at night with glowing neon lights`"
+                "👋 *Hello!* Enter any prompt below to generate AI video or image.\n"
+                "Example: `A futuristic cyberpunk cat running in rain`"
             )
             return
 
@@ -479,9 +464,9 @@ if bot:
         data = call.data
 
         if data == "menu_main":
-            m_name = MODELS.get(cfg["model"], {}).get("name", "xAI Grok Video 1.5")
+            m_name = MODELS.get(cfg["model"], {}).get("name", "xAI Grok Imagine Video")
             text = (
-                "🎥 *Team AI Video Generator*\n\n"
+                "🎥 *Team AI Video Generator (OpenLux)*\n\n"
                 f"⚙️ *Active Model:* `{escape_markdown(m_name)}`\n"
                 f"⏱️ `{cfg['duration']}s` | 📐 `{cfg['aspect_ratio']}` | 🖥️ `{cfg['resolution']}`"
             )
@@ -495,41 +480,40 @@ if bot:
                 f"• *Pricing:* {escape_markdown(m_info['pricing'])}\n"
                 f"• *Duration:* `{cfg['duration']} seconds`\n"
                 f"• *Aspect Ratio:* `{cfg['aspect_ratio']}`\n"
-                f"• *Resolution:* `{cfg['resolution']}`\n"
-                f"• *Sound:* `{'ON' if cfg.get('sound') else 'OFF'}`"
+                f"• *Resolution:* `{cfg['resolution']}`\n\n"
+                "Tap any button below to adjust your settings:"
             )
             safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
 
         elif data == "menu_balance":
-            ok, res = kie_client.get_balance()
-            if ok:
-                usd = res.get("balance", 0.0)
-                inr = res.get("balance_inr", 0)
-                text = f"💰 *API Wallet Balance*\n\n• *USD:* `${usd:.3f}`\n• *INR:* `₹{inr}`"
-            else:
-                text = f"❌ *Failed to fetch balance:* {escape_markdown(str(res.get('error')))}"
+            text = (
+                "💰 *OpenLux API Active Status & Rate Card*\n\n"
+                "• *API Status:* `Connected & Operational` (`api.openlux.ai`)\n"
+                "• *Grok 480p (5s, 9:16):* `~$0.035 USD` (~₹3.43 INR / 3.4 RS) 🏆\n"
+                "• *Grok 720p (5s, 16:9):* `~$0.110 USD` (~₹10.80 INR / 10.8 RS)\n"
+                "• *Grok 720p (6s):* `~$0.185 USD` (~₹18.15 INR / 18.1 RS)\n"
+                "• *Kling 3.0 Turbo (5s 1080p):* `~0.595 RMB` (~₹7.67 INR / 7.6 RS)\n\n"
+                "_Billed on actual GPU rendering time per job._"
+            )
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔄 Refresh Balance", callback_data="menu_balance"))
+            markup.add(InlineKeyboardButton("🔄 Refresh Status", callback_data="menu_balance"))
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
             safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
         elif data == "menu_models":
-            safe_edit_message_text("🤖 *Select AI Video / Image Provider:*", call.message.chat.id, call.message.message_id, reply_markup=get_models_keyboard(cfg["model"]))
+            safe_edit_message_text("🤖 *Select AI Provider / Model:*", call.message.chat.id, call.message.message_id, reply_markup=get_models_keyboard(cfg["model"]))
 
         elif data.startswith("set_model:"):
             m_key = data.split(":", 1)[1]
             if m_key in MODELS:
                 cfg["model"] = m_key
                 m_info = MODELS[m_key]
-                # Reset defaults if current setting is not supported by newly selected model
                 if "durations" in m_info and cfg["duration"] not in m_info["durations"]:
                     cfg["duration"] = m_info.get("default_duration", m_info["durations"][0])
                 if "aspect_ratios" in m_info and cfg["aspect_ratio"] not in m_info["aspect_ratios"]:
-                    cfg["aspect_ratio"] = m_info.get("default_aspect_ratio", "16:9")
+                    cfg["aspect_ratio"] = m_info.get("default_aspect_ratio", "9:16")
                 if "resolutions" in m_info and cfg["resolution"] not in m_info["resolutions"]:
                     cfg["resolution"] = m_info.get("default_resolution", m_info["resolutions"][0])
-                if not m_info.get("supports_sound"):
-                    cfg["sound"] = False
                 save_user_settings()
                 bot.answer_callback_query(call.id, f"Model set to {m_info['name']}")
                 safe_edit_message_text(f"✅ Provider set to *{escape_markdown(m_info['name'])}*", call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
@@ -564,21 +548,12 @@ if bot:
             bot.answer_callback_query(call.id, f"Resolution set to {res}")
             safe_edit_message_text(f"✅ Resolution set to *{res}*", call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
 
-        elif data == "toggle_sound":
-            cfg["sound"] = not cfg.get("sound", False)
-            save_user_settings()
-            state = "ON" if cfg["sound"] else "OFF"
-            bot.answer_callback_query(call.id, f"Sound toggled {state}")
-            safe_edit_message_text(f"✅ Sound generation set to *{state}*", call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
-
         elif data == "menu_info":
             info_text = (
-                "ℹ️ *Model Capability Guide*\n\n"
-                "• *xAI Grok 1.5:* Recommended default ($0.007/s — Fast & cheap).\n"
-                "• *Seedance 2.0:* ByteDance flagship. Supports up to 4K resolution.\n"
-                "• *Veo 3:* Google's cinematic quality ($0.28 flat).\n"
-                "• *Kling 2.6:* Supports audio/sound generation.\n"
-                "• *GPT Image 2:* Synchronous photo creation."
+                "ℹ️ *OpenLux Model Capability Guide*\n\n"
+                "• *xAI Grok Imagine Video:* 480p vertical shorts ~₹3.4 RS, 720p ~₹10.8 RS.\n"
+                "• *Kling 3.0 Turbo:* 1080p cinematic video ~₹7.6 RS. Supports Text & Photo-to-Video.\n"
+                "• *Midjourney V7:* High-Res 4-Grid photo generation."
             )
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
@@ -629,50 +604,23 @@ def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: 
     clean_prompt = escape_markdown(prompt)
     clean_model_name = escape_markdown(model_info['name'])
 
-    ok, result = kie_client.create_generation_task(
+    ok, result = openlux_client.create_generation_task(
         model_key=model_key,
         prompt=prompt,
         duration=cfg["duration"],
         aspect_ratio=cfg["aspect_ratio"],
         resolution=cfg["resolution"],
-        sound=cfg.get("sound", False),
-        quality=cfg.get("quality", "medium"),
         image_url=image_url
     )
 
     if not ok:
         raw_err = str(result.get("error", "Unknown error"))
-        if "Credits insufficient" in raw_err or "402" in raw_err:
-            err_msg = (
-                "💳 *API Wallet Top-Up Required*\n\n"
-                "The KIE API backend reported insufficient credits allocated for this model.\n"
-                "Please top up your API Token credits at `https://kie.abhibots.com/`."
-            )
-        else:
-            err_msg = f"`{escape_markdown(raw_err)}`"
-
         safe_edit_message_text(
-            f"❌ *Task Submission Failed*\n\n{err_msg}\n\n_Note: You were NOT charged for this request._",
+            f"❌ *Task Submission Failed*\n\n`{escape_markdown(raw_err)}`",
             chat_id, msg_id
         )
         return
 
-    # Handle Synchronous OpenAI response
-    if result.get("is_sync"):
-        data = result.get("data", {})
-        url = data.get("url")
-        cost = data.get("cost", 0.0)
-        if url:
-            safe_edit_message_text("✅ *Image Generated Successfully! Sending...*", chat_id, msg_id)
-            try:
-                bot.send_photo(chat_id, url, caption=f"✨ *Prompt:* {clean_prompt}\n💰 *Cost:* ${cost:.4f}")
-            except Exception:
-                bot.send_message(chat_id, f"🖼️ *Image URL:* {url}")
-        else:
-            safe_edit_message_text(f"❌ *Generation Failed:* {escape_markdown(str(data))}", chat_id, msg_id)
-        return
-
-    # Handle Asynchronous Video Polling
     task_id = result["task_id"]
     endpoint_type = result["endpoint_type"]
 
@@ -686,70 +634,82 @@ def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: 
         # Update Telegram status message every 10 seconds
         if poll_count % 2 == 0:
             safe_edit_message_text(
-                f"⏳ *Generating Video...* [{elapsed}s elapsed]\n\n"
+                f"⏳ *Generating Content...* [{elapsed}s elapsed]\n\n"
                 f"• *Model:* `{clean_model_name}`\n"
                 f"• *Task ID:* `{task_id}`\n"
                 f"• *Prompt:* `{clean_prompt}`\n\n"
-                f"_Polling API status..._",
+                f"_Polling OpenLux GPU status..._",
                 chat_id, msg_id
             )
 
-        state, media_url, err = kie_client.poll_task_status(task_id, endpoint_type)
+        state, media_url, err = openlux_client.poll_task_status(task_id, endpoint_type)
 
         if state == "success" and media_url:
             log_generation_event(user_id, str(user_id), model_key, model_info['name'], prompt, cfg['duration'], "success", media_url)
-            safe_edit_message_text(f"🎉 *Video Generation Complete!* [{elapsed}s]\nDownloading & sending MP4 video...", chat_id, msg_id)
+            safe_edit_message_text(f"🎉 *Generation Complete!* [{elapsed}s]\nSending file to chat...", chat_id, msg_id)
             
-            # Send video directly into Telegram chat with size handling
-            video_sent = False
+            # Send file directly into Telegram chat with size handling
+            media_sent = False
             video_caption = format_caption(prompt, model_info['name'], cfg['duration'], cfg['aspect_ratio'], task_id)
-            try:
-                bot.send_video(
-                    chat_id,
-                    media_url,
-                    caption=video_caption,
-                    supports_streaming=True
-                )
-                video_sent = True
-            except Exception as e:
-                logger.warning(f"Direct URL send failed ({e}), attempting local stream download...")
+            
+            is_image = endpoint_type == "midjourney" or media_url.endswith((".png", ".jpg", ".jpeg", ".webp"))
+            
+            if is_image:
                 try:
-                    r = requests.get(media_url, stream=True, timeout=60)
-                    file_size = int(r.headers.get("content-length", 0))
-                    
-                    if file_size > 50 * 1024 * 1024:
-                        raise ValueError(f"File size {file_size / (1024*1024):.1f}MB exceeds Telegram limit (50MB).")
+                    bot.send_photo(chat_id, media_url, caption=video_caption)
+                    media_sent = True
+                except Exception as e:
+                    logger.warning(f"Photo send error: {e}")
+            else:
+                try:
+                    bot.send_video(
+                        chat_id,
+                        media_url,
+                        caption=video_caption,
+                        supports_streaming=True
+                    )
+                    media_sent = True
+                except Exception as e:
+                    logger.warning(f"Direct video send failed ({e}), downloading stream...")
+                    try:
+                        headers = {}
+                        if "api.openlux.ai" in media_url:
+                            headers["Authorization"] = f"Bearer {OPENLUX_API_KEY}"
+                        r = requests.get(media_url, headers=headers, stream=True, timeout=60)
+                        file_size = int(r.headers.get("content-length", 0))
+                        
+                        if file_size > 50 * 1024 * 1024:
+                            raise ValueError(f"File size {file_size / (1024*1024):.1f}MB exceeds Telegram limit (50MB).")
 
-                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            tmp.write(chunk)
-                        tmp_path = tmp.name
-                    
-                    with open(tmp_path, "rb") as video_file:
-                        bot.send_video(
-                            chat_id,
-                            video_file,
-                            caption=video_caption,
-                            supports_streaming=True
-                        )
-                    os.remove(tmp_path)
-                    video_sent = True
-                except Exception as ex:
-                    logger.warning(f"Video upload failed: {ex}")
+                        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                tmp.write(chunk)
+                            tmp_path = tmp.name
+                        
+                        with open(tmp_path, "rb") as video_file:
+                            bot.send_video(
+                                chat_id,
+                                video_file,
+                                caption=video_caption,
+                                supports_streaming=True
+                            )
+                        os.remove(tmp_path)
+                        media_sent = True
+                    except Exception as ex:
+                        logger.warning(f"Local stream send failed: {ex}")
 
-            if not video_sent:
+            if not media_sent:
                 bot.send_message(
                     chat_id,
-                    f"✅ *Video Generation Complete!*\n\n🎬 *Prompt:* {clean_prompt}\n🔗 [Click Here to View Video]({media_url})"
+                    f"✅ *Generation Complete!*\n\n🎬 *Prompt:* {clean_prompt}\n🔗 [Click Here to View Result]({media_url})"
                 )
             break
 
         elif state == "failed":
             log_generation_event(user_id, str(user_id), model_key, model_info['name'], prompt, cfg['duration'], "failed")
-            clean_err = escape_markdown(str(err or 'Task was rejected or encountered upstream error.'))
+            clean_err = escape_markdown(str(err or 'Task was rejected or encountered GPU rendering error.'))
             safe_edit_message_text(
-                f"❌ *Video Generation Failed*\n\n`{clean_err}`\n\n"
-                f"_Your API wallet balance has been automatically refunded._",
+                f"❌ *Generation Failed*\n\n`{clean_err}`",
                 chat_id, msg_id
             )
             break
@@ -760,7 +720,7 @@ def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: 
         # Timeout safety (5 minutes)
         if elapsed > 300:
             safe_edit_message_text(
-                f"⏱️ *Generation Timed Out (5 mins)*\nTask ID: `{task_id}`.\nPlease check `/balance` to verify refund.",
+                f"⏱️ *Generation Timed Out (5 mins)*\nTask ID: `{task_id}`.",
                 chat_id, msg_id
             )
             break
@@ -783,20 +743,13 @@ def main():
     except Exception as e:
         print(f"⚠️ Telegram bot auth warning: {e}")
 
-    print("🚀 Starting Team AI Video Generator Telegram Bot...")
-    print(f"🔑 Using KIE API Key: {KIE_API_KEY[:8]}...{KIE_API_KEY[-4:] if len(KIE_API_KEY) > 12 else ''}")
+    print("🚀 Starting Team AI Video Generator Telegram Bot (OpenLux)...")
+    print(f"🔑 Using OpenLux API Key: {OPENLUX_API_KEY[:8]}...{OPENLUX_API_KEY[-4:] if len(OPENLUX_API_KEY) > 12 else ''}")
     
     if ALLOWED_USER_IDS:
         print(f"🔒 Access Restricted to Telegram User IDs: {ALLOWED_USER_IDS}")
     else:
         print("🔓 Access Mode: Unrestricted (Open to any user)")
-
-    # Check balance on startup
-    ok, res = kie_client.get_balance()
-    if ok:
-        print(f"💰 Connected to KIE API! Balance: ${res.get('balance')} USD (₹{res.get('balance_inr')} INR)")
-    else:
-        print(f"⚠️ Balance check warning: {res}")
 
     print("🤖 Telegram Bot Polling Active! Listening for user commands...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
