@@ -15,7 +15,7 @@ OPENLUX_BASE_URL = os.getenv("OPENLUX_BASE_URL", "https://api.openlux.ai")
 raw_allowed = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(i.strip()) for i in raw_allowed.split(",") if i.strip().isdigit()]
 
-# Supported OpenLux AI Video & Image Models Definition
+# Supported OpenLux AI Video Models Definition (Grok & Kling Only)
 MODELS = {
     "grok": {
         "name": "xAI Grok Imagine Video",
@@ -25,9 +25,9 @@ MODELS = {
         "default_duration": "5",
         "aspect_ratios": ["9:16", "16:9", "1:1"],
         "default_aspect_ratio": "9:16",
-        "resolutions": ["480p", "720p", "1080p"],
-        "default_resolution": "480p",
-        "pricing": "480p ~₹3.4 RS | 720p ~₹10.8 RS (5s)",
+        "resolutions": ["720p", "1080p", "480p"],
+        "default_resolution": "720p",
+        "pricing": "$0.11 USD (~₹10.80 INR per 5s clip)",
         "supports_image": False
     },
     "kling": {
@@ -40,21 +40,8 @@ MODELS = {
         "default_aspect_ratio": "16:9",
         "resolutions": ["1080p"],
         "default_resolution": "1080p",
-        "pricing": "1080p ~₹7.6 RS (Text & Image-to-Video)",
+        "pricing": "0.595 RMB (~₹7.67 INR / Text & Photo-to-Video)",
         "supports_image": True
-    },
-    "midjourney": {
-        "name": "Midjourney V7 Photo",
-        "api_model": "midjourney-v7",
-        "endpoint_type": "midjourney",
-        "durations": ["1"],
-        "default_duration": "1",
-        "aspect_ratios": ["1:1", "16:9", "9:16"],
-        "default_aspect_ratio": "1:1",
-        "resolutions": ["1024x1024"],
-        "default_resolution": "1024x1024",
-        "pricing": "High-Res 4-Grid Image Generation",
-        "supports_image": False
     }
 }
 
@@ -63,7 +50,7 @@ DEFAULT_USER_SETTINGS = {
     "model": "grok",
     "duration": "5",
     "aspect_ratio": "9:16",
-    "resolution": "480p",
+    "resolution": "720p",
     "quality": "medium",
     "sound": False
 }

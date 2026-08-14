@@ -21,15 +21,15 @@ class OpenLuxClient:
         prompt: str,
         duration: str = "5",
         aspect_ratio: str = "9:16",
-        resolution: str = "480p",
+        resolution: str = "720p",
         image_url: Optional[str] = None
     ) -> Tuple[bool, Dict[str, Any]]:
         """
-        Create a video or image generation job on OpenLux API.
+        Create a video generation job on OpenLux API (Grok Imagine Video or Kling 3.0 Turbo).
         Returns (success, result_dict_or_error).
         """
         if model_key not in MODELS:
-            return False, {"error": f"Unknown model key '{model_key}'"}
+            model_key = "grok"
 
         model_config = MODELS[model_key]
         endpoint_type = model_config["endpoint_type"]
@@ -42,7 +42,7 @@ class OpenLuxClient:
                 "model": "grok-imagine-video",
                 "prompt": prompt,
                 "aspect_ratio": aspect_ratio,  # "9:16", "16:9", "1:1"
-                "resolution": resolution,      # "480p", "720p", "1080p"
+                "resolution": resolution,      # "720p", "1080p", "480p"
                 "duration": dur_int            # 5, 6, 10
             }
             try:
@@ -93,26 +93,6 @@ class OpenLuxClient:
                         }
                     return False, {"error": f"Kling API error: {data}"}
                 return False, {"error": f"Kling Error {res.status_code}: {res.text}"}
-            except Exception as e:
-                return False, {"error": str(e)}
-
-        # 3. Midjourney V7 Photo Generation
-        elif endpoint_type == "midjourney":
-            url = f"{self.base_url}/mj/submit/imagine"
-            payload = {"prompt": f"{prompt} --v 7"}
-            try:
-                res = requests.post(url, headers=self.headers, json=payload, timeout=30)
-                if res.status_code == 200:
-                    data = res.json()
-                    task_id = data.get("result")
-                    if task_id:
-                        return True, {
-                            "task_id": task_id,
-                            "endpoint_type": "midjourney",
-                            "model_key": model_key
-                        }
-                    return False, {"error": f"No Midjourney task_id: {data}"}
-                return False, {"error": f"Midjourney Error {res.status_code}: {res.text}"}
             except Exception as e:
                 return False, {"error": str(e)}
 
@@ -170,29 +150,6 @@ class OpenLuxClient:
 
                 elif status in ["failed", "FAILED"]:
                     err_msg = data.get("task_status_msg") or "Kling video generation failed."
-                    return "failed", None, str(err_msg)
-
-                else:
-                    return "processing", None, None
-
-            # 3. Midjourney V7 Polling
-            elif endpoint_type == "midjourney":
-                url = f"{self.base_url}/mj/task/{task_id}/fetch"
-                res = requests.get(url, headers=self.headers, timeout=15)
-                if res.status_code != 200:
-                    return "error", None, f"HTTP {res.status_code}: {res.text}"
-
-                data = res.json()
-                status = data.get("status")
-
-                if status == "SUCCESS":
-                    img_url = data.get("imageUrl")
-                    if img_url and img_url.startswith("http"):
-                        return "success", img_url, None
-                    return "failed", None, f"No Midjourney image URL: {data}"
-
-                elif status in ["FAILED", "failed"]:
-                    err_msg = data.get("failReason") or "Midjourney image generation failed."
                     return "failed", None, str(err_msg)
 
                 else:

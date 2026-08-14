@@ -1,0 +1,24 @@
+[
+  {
+    "timestamp": "2026-08-13 13:27:12",
+    "user_id": 8558803643,
+    "user_name": "8558803643",
+    "model_key": "runway",
+    "model_name": "Runway Gen-4",
+    "prompt": "Photorealistic male factory supplier in his 40s, wearing a plain T-shirt labeled \u201cSUPPLIER,\u201d standing casually inside a busy warehouse office, realistic Indian/Asian appearance, slightly tired expression, natural posture, authentic industrial environment, cinematic commercial lighting, realistic skin and clothing textures, subtle background workers and stacked cardboard boxes, shallow depth of field, professional documentary-style footage, natural human movement, no exaggerated acting.",
+    "duration": "5",
+    "status": "success",
+    "media_url": "https://tempfile.aiquickdraw.com/p/a45ebb8ee0964731badfecae9fdcf300_1_1786607827_7351.mp4"
+  },
+  {
+    "timestamp": "2026-08-13 13:33:43",
+    "user_id": 8558803643,
+    "user_name": "8558803643",
+    "model_key": "runway",
+    "model_name": "Runway Gen-4",
+    "prompt": "0:00\u20130:04 \u2014 Main shot: Young woman holds the box of chunky outdated jewellery toward camera, unimpressed. She locks eyes with camera, shakes the box and delivers with exaggerated mock enthusiasm:\n\u201cCongratulations on stocking the product that was trending four months ago!\u201d\nEmphasize \u201cCongratulations\u201d and \u201cfour months ago\u201d with sharp sarcasm. Jewellery audibly jingles with the shake.\n0:04\u20130:05 \u2014 Cutaway: Quick hard cut to a close-up inside the box as the tangled gold jewellery rattles and settles, catching light.\n0:05\u20130:07 \u2014 Main shot: Cut back. She leans slightly toward camera, gives one final shake and says firmly:\n\u201cAapke competition ne aapko already takkar de chuka hain.\u201d\nEnd with a flat, knowing look and tiny smirk.\nCamera: Static main shot, hard cuts only. No zooms/pans.\nAudio: Loud, fast female delivery, heavy sarcasm; clear metallic jewellery jingles; light shop ambience, no music.",
+    "duration": "5",
+    "status": "success",
+    "media_url": "https://tempfile.aiquickdraw.com/p/cd13702b552f4377a9c7ea6734cc184c_1_1786608222_3292.mp4"
+  }
+]
