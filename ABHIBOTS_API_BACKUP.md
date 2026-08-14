@@ -7,8 +7,8 @@ This document contains the complete configuration, API endpoints, payload format
 ## 🔑 Credentials & Base URLs
 
 * **Base URL**: `https://vgen.abhibots.com` (redirects to `https://kie.abhibots.com`)
-* **Legacy API Key**: `kie-e3a1c2dceb29a009a4309697122339e8`
-* **Auth Header**: `Authorization: Bearer kie-e3a1c2dceb29a009a4309697122339e8`
+* **Legacy API Key**: `[REDACTED — rotate before any future use]`
+* **Auth Header**: `Authorization: Bearer <LEGACY_API_KEY>`
 
 ---
 
