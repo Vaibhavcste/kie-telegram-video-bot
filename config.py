@@ -27,7 +27,7 @@ MODELS = {
         "default_aspect_ratio": "9:16",
         "resolutions": ["480p", "720p", "1080p"],
         "default_resolution": "480p",
-        "pricing": "xAI Grok Video Model",
+        "pricing": "Grok Imagine Video",
         "supports_image": False
     },
     "kling": {
@@ -40,7 +40,7 @@ MODELS = {
         "default_aspect_ratio": "16:9",
         "resolutions": ["1080p", "720p"],
         "default_resolution": "1080p",
-        "pricing": "Kling 3.0 Video Model",
+        "pricing": "Kling 3.0 Video",
         "supports_image": True
     }
 }

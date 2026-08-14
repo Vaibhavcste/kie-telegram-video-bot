@@ -57,7 +57,7 @@ def save_user_settings():
         except Exception as e:
             logger.error(f"Failed to save user settings: {e}")
 
-# Generation & Spending History Tracking
+# Generation History Tracking
 history_lock = threading.Lock()
 HISTORY_FILE = "generation_history.json"
 generation_history = []
@@ -278,16 +278,6 @@ if bot:
         )
         bot.send_message(msg.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
-    @bot.message_handler(commands=["balance"])
-    def cmd_balance(msg: Message):
-        if not check_access(msg): return
-        text = (
-            "💰 *API Status*\n\n"
-            "• *Status:* `Connected & Operational`\n"
-            "• *Active Models:* `xAI Grok Imagine Video`, `Kuaishou Kling 3.0 Turbo`"
-        )
-        bot.send_message(msg.chat.id, text)
-
     @bot.message_handler(commands=["settings"])
     def cmd_settings(msg: Message):
         if not check_access(msg): return
@@ -475,17 +465,6 @@ if bot:
                 "Tap any button below to adjust your settings:"
             )
             safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
-
-        elif data == "menu_balance":
-            text = (
-                "💰 *API Connection Status*\n\n"
-                "• *Status:* `Connected & Operational` (`api.openlux.ai`)\n"
-                "• *Active Models:* `xAI Grok Imagine Video`, `Kuaishou Kling 3.0 Turbo`"
-            )
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔄 Refresh Status", callback_data="menu_balance"))
-            markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
-            safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
         elif data == "menu_history":
             load_history()
