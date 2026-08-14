@@ -15,7 +15,7 @@ OPENLUX_BASE_URL = os.getenv("OPENLUX_BASE_URL", "https://api.openlux.ai")
 raw_allowed = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(i.strip()) for i in raw_allowed.split(",") if i.strip().isdigit()]
 
-# Supported OpenLux AI Video Models Definition (Grok & Kling Only)
+# Supported OpenLux AI Video Models Definition
 MODELS = {
     "grok": {
         "name": "xAI Grok Imagine Video",
@@ -25,9 +25,9 @@ MODELS = {
         "default_duration": "5",
         "aspect_ratios": ["9:16", "16:9", "1:1"],
         "default_aspect_ratio": "9:16",
-        "resolutions": ["720p", "1080p", "480p"],
-        "default_resolution": "720p",
-        "pricing": "$0.11 USD (~₹10.80 INR per 5s clip)",
+        "resolutions": ["480p", "720p", "1080p"],
+        "default_resolution": "480p",
+        "pricing": "xAI Grok Video Model",
         "supports_image": False
     },
     "kling": {
@@ -38,9 +38,9 @@ MODELS = {
         "default_duration": "5",
         "aspect_ratios": ["16:9", "9:16"],
         "default_aspect_ratio": "16:9",
-        "resolutions": ["1080p"],
+        "resolutions": ["1080p", "720p"],
         "default_resolution": "1080p",
-        "pricing": "0.595 RMB (~₹7.67 INR / Text & Photo-to-Video)",
+        "pricing": "Kling 3.0 Video Model",
         "supports_image": True
     }
 }
@@ -50,7 +50,7 @@ DEFAULT_USER_SETTINGS = {
     "model": "grok",
     "duration": "5",
     "aspect_ratio": "9:16",
-    "resolution": "720p",
+    "resolution": "480p",
     "quality": "medium",
     "sound": False
 }

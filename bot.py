@@ -97,7 +97,6 @@ def get_user_config(user_id: int) -> Dict[str, Any]:
         if user_id not in user_settings:
             user_settings[user_id] = DEFAULT_USER_SETTINGS.copy()
         else:
-            # Auto-repair model if removed or corrupted
             if user_settings[user_id].get("model") not in MODELS:
                 user_settings[user_id]["model"] = "grok"
             ar = str(user_settings[user_id].get("aspect_ratio", ""))
@@ -168,11 +167,11 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.row(
         InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-        InlineKeyboardButton("💰 Rates & Balance", callback_data="menu_balance")
+        InlineKeyboardButton("🤖 Select Model", callback_data="menu_models")
     )
     markup.row(
-        InlineKeyboardButton("🤖 Select Provider / Model", callback_data="menu_models"),
-        InlineKeyboardButton("ℹ️ Model Info", callback_data="menu_info")
+        InlineKeyboardButton("📊 History & Usage", callback_data="menu_history"),
+        InlineKeyboardButton("ℹ️ Help & Info", callback_data="menu_info")
     )
     return markup
 
@@ -184,7 +183,7 @@ def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     
     # Provider Row
-    markup.add(InlineKeyboardButton(f"🤖 Provider: {model_info['name']}", callback_data="menu_models"))
+    markup.add(InlineKeyboardButton(f"🤖 Model: {model_info['name']}", callback_data="menu_models"))
 
     # Duration Row
     dur_btn_text = f"⏱️ Duration: {cfg['duration']}s"
@@ -205,7 +204,7 @@ def get_models_keyboard(current_model: str) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     for m_key, m_info in MODELS.items():
         prefix = "✅ " if m_key == current_model else ""
-        markup.add(InlineKeyboardButton(f"{prefix}{m_info['name']} ({m_info['pricing']})", callback_data=f"set_model:{m_key}"))
+        markup.add(InlineKeyboardButton(f"{prefix}{m_info['name']}", callback_data=f"set_model:{m_key}"))
     markup.add(InlineKeyboardButton("⬅️ Back to Settings", callback_data="menu_settings"))
     return markup
 
@@ -240,7 +239,7 @@ def get_ratios_keyboard(model_key: str, current_ratio: str) -> InlineKeyboardMar
 def get_resolutions_keyboard(model_key: str, current_res: str) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     model_info = MODELS.get(model_key, MODELS["grok"])
-    res_list = model_info.get("resolutions", ["720p", "1080p", "480p"])
+    res_list = model_info.get("resolutions", ["480p", "720p", "1080p"])
     
     buttons = []
     for res in res_list:
@@ -269,14 +268,13 @@ if bot:
         welcome_text = (
             "🎥 *Welcome to Team AI Video Generator!*\n\n"
             "Generate flagship AI videos directly in Telegram:\n"
-            "• *xAI Grok Imagine Video* (`$0.11 USD` / ~₹10.80 INR per 5s clip)\n"
-            "• *Kuaishou Kling 3.0 Turbo* (`0.595 RMB` / ~₹7.67 INR | Text & Photo-to-Video)\n\n"
-            f"⚙️ *Active Model:* `{escape_markdown(m_name)}` ({cfg['duration']}s | {cfg['aspect_ratio']} | {cfg['resolution']})\n\n"
+            "• *xAI Grok Imagine Video*\n"
+            "• *Kuaishou Kling 3.0 Turbo* (Text & Photo-to-Video)\n\n"
+            f"⚙️ *Active Preset:* `{escape_markdown(m_name)}` ({cfg['duration']}s | {cfg['aspect_ratio']} | {cfg['resolution']})\n\n"
             "💡 *How to use:*\n"
             "1. Simply *type any video prompt* (e.g. `A drone shot over mountain peaks at sunset`) and hit send!\n"
             "2. Or *send a photo with a caption* to animate it into a video using Kling 3.0!\n"
-            "3. Use `/settings` to customize model, duration, resolution & aspect ratio.\n"
-            "4. Use `/balance` to check pricing & API status."
+            "3. Use `/settings` to adjust model, duration (seconds), resolution & aspect ratio."
         )
         bot.send_message(msg.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
@@ -284,13 +282,9 @@ if bot:
     def cmd_balance(msg: Message):
         if not check_access(msg): return
         text = (
-            "💰 *OpenLux API Active Status & Rate Card*\n\n"
-            "• *API Status:* `Connected & Operational` (`api.openlux.ai`)\n"
-            "• *Grok Imagine Video (5s clip):* `$0.110 USD` (~₹10.80 INR / ~₹10)\n"
-            "• *Grok Imagine Video (6s clip):* `$0.185 USD` (~₹18.15 INR)\n"
-            "• *Grok Imagine Video (10s clip):* `$0.308 USD` (~₹30.26 INR)\n"
-            "• *Kling 3.0 Turbo (5s 1080p):* `0.595 RMB` (~₹7.67 INR / ~₹7.6)\n\n"
-            "_Billed on actual GPU rendering time per job._"
+            "💰 *API Status*\n\n"
+            "• *Status:* `Connected & Operational`\n"
+            "• *Active Models:* `xAI Grok Imagine Video`, `Kuaishou Kling 3.0 Turbo`"
         )
         bot.send_message(msg.chat.id, text)
 
@@ -302,12 +296,11 @@ if bot:
         m_info = MODELS.get(cfg["model"], MODELS["grok"])
         text = (
             "⚙️ *Video Generation Settings*\n\n"
-            f"• *Provider:* `{escape_markdown(m_info['name'])}`\n"
-            f"• *Pricing:* {escape_markdown(m_info['pricing'])}\n"
+            f"• *Model:* `{escape_markdown(m_info['name'])}`\n"
             f"• *Duration:* `{cfg['duration']} seconds`\n"
             f"• *Aspect Ratio:* `{cfg['aspect_ratio']}`\n"
             f"• *Resolution:* `{cfg['resolution']}`\n\n"
-            "Tap any button below to adjust your settings:"
+            "Tap any button below to adjust your parameters:"
         )
         bot.send_message(msg.chat.id, text, reply_markup=get_settings_keyboard(user_id))
 
@@ -316,7 +309,7 @@ if bot:
         if not check_access(msg): return
         text = "🤖 *Available AI Video Models:*\n\n"
         for k, info in MODELS.items():
-            text += f"• *{escape_markdown(info['name'])}*\n  └ Pricing: `{escape_markdown(info['pricing'])}`\n"
+            text += f"• *{escape_markdown(info['name'])}*\n"
         text += "\nUse `/settings` to switch your active model."
         bot.send_message(msg.chat.id, text)
 
@@ -370,7 +363,7 @@ if bot:
             total_jobs = len(generation_history)
             recent = generation_history[-8:]
             
-            history_text = f"📊 *Team Generation & Spending Log ({total_jobs} Total Jobs)*\n\n*Recent Generations:*\n"
+            history_text = f"📊 *Team Generation Log ({total_jobs} Total Jobs)*\n\n*Recent Generations:*\n"
             for item in reversed(recent):
                 status_icon = "✅" if item.get("status") == "success" else "❌"
                 clean_p = escape_markdown(item.get("prompt", ""))[:40]
@@ -408,7 +401,7 @@ if bot:
             target_model = "kling"
             notice_prefix = "ℹ️ *Notice:* Photos require an Image-to-Video model. Animating photo using *Kuaishou Kling 3.0 Turbo* (your default active model remains unchanged).\n\n"
 
-        status_msg = bot.send_message(chat_id, f"{notice_prefix}📤 *Processing photo for OpenLux API...*")
+        status_msg = bot.send_message(chat_id, f"{notice_prefix}📤 *Processing photo for API...*")
         try:
             file_info = bot.get_file(msg.photo[-1].file_id)
             img_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
@@ -465,7 +458,7 @@ if bot:
         if data == "menu_main":
             m_name = MODELS.get(cfg["model"], {}).get("name", "xAI Grok Imagine Video")
             text = (
-                "🎥 *Team AI Video Generator (OpenLux)*\n\n"
+                "🎥 *Team AI Video Generator*\n\n"
                 f"⚙️ *Active Model:* `{escape_markdown(m_name)}`\n"
                 f"⏱️ `{cfg['duration']}s` | 📐 `{cfg['aspect_ratio']}` | 🖥️ `{cfg['resolution']}`"
             )
@@ -475,8 +468,7 @@ if bot:
             m_info = MODELS.get(cfg["model"], MODELS["grok"])
             text = (
                 "⚙️ *Video Generation Settings*\n\n"
-                f"• *Provider:* `{escape_markdown(m_info['name'])}`\n"
-                f"• *Pricing:* {escape_markdown(m_info['pricing'])}\n"
+                f"• *Model:* `{escape_markdown(m_info['name'])}`\n"
                 f"• *Duration:* `{cfg['duration']} seconds`\n"
                 f"• *Aspect Ratio:* `{cfg['aspect_ratio']}`\n"
                 f"• *Resolution:* `{cfg['resolution']}`\n\n"
@@ -486,16 +478,31 @@ if bot:
 
         elif data == "menu_balance":
             text = (
-                "💰 *OpenLux API Active Status & Rate Card*\n\n"
-                "• *API Status:* `Connected & Operational` (`api.openlux.ai`)\n"
-                "• *Grok Imagine Video (5s clip):* `$0.110 USD` (~₹10.80 INR / ~₹10)\n"
-                "• *Grok Imagine Video (6s clip):* `$0.185 USD` (~₹18.15 INR)\n"
-                "• *Grok Imagine Video (10s clip):* `$0.308 USD` (~₹30.26 INR)\n"
-                "• *Kling 3.0 Turbo (5s 1080p):* `0.595 RMB` (~₹7.67 INR / ~₹7.6)\n\n"
-                "_Billed on actual GPU rendering time per job._"
+                "💰 *API Connection Status*\n\n"
+                "• *Status:* `Connected & Operational` (`api.openlux.ai`)\n"
+                "• *Active Models:* `xAI Grok Imagine Video`, `Kuaishou Kling 3.0 Turbo`"
             )
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🔄 Refresh Status", callback_data="menu_balance"))
+            markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
+            safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+        elif data == "menu_history":
+            load_history()
+            with history_lock:
+                if not generation_history:
+                    text = "📊 *No generation history recorded yet.*"
+                else:
+                    total_jobs = len(generation_history)
+                    recent = generation_history[-8:]
+                    text = f"📊 *Team Generation Log ({total_jobs} Total Jobs)*\n\n*Recent Generations:*\n"
+                    for item in reversed(recent):
+                        status_icon = "✅" if item.get("status") == "success" else "❌"
+                        clean_p = escape_markdown(item.get("prompt", ""))[:40]
+                        clean_m = escape_markdown(item.get("model_name", ""))
+                        clean_u = escape_markdown(item.get("user_name", str(item.get("user_id"))))
+                        text += f"{status_icon} *{clean_m}* ({item.get('duration')}s) — ID: `{clean_u}`\n  └ `\"{clean_p}...\"` [{item.get('timestamp')}]\n"
+            markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
             safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
@@ -549,9 +556,9 @@ if bot:
 
         elif data == "menu_info":
             info_text = (
-                "ℹ️ *OpenLux Video Model Capability Guide*\n\n"
-                "• *xAI Grok Imagine Video:* 5s clip ~$0.11 USD (~₹10.80 INR). Fastest & highly cinematic.\n"
-                "• *Kuaishou Kling 3.0 Turbo:* 5s 1080p clip ~0.595 RMB (~₹7.67 INR). Supports Text & Photo-to-Video."
+                "ℹ️ *Video Model Capabilities*\n\n"
+                "• *xAI Grok Imagine Video:* Fastest & highly cinematic text-to-video generation.\n"
+                "• *Kuaishou Kling 3.0 Turbo:* High HD realism. Supports Text & Photo-to-Video."
             )
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
@@ -636,7 +643,7 @@ def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: 
                 f"• *Model:* `{clean_model_name}`\n"
                 f"• *Task ID:* `{task_id}`\n"
                 f"• *Prompt:* `{clean_prompt}`\n\n"
-                f"_Polling OpenLux GPU status..._",
+                f"_Polling GPU status..._",
                 chat_id, msg_id
             )
 
@@ -732,7 +739,7 @@ def main():
     except Exception as e:
         print(f"⚠️ Telegram bot auth warning: {e}")
 
-    print("🚀 Starting Team AI Video Generator Telegram Bot (OpenLux)...")
+    print("🚀 Starting Team AI Video Generator Telegram Bot...")
     print(f"🔑 Using OpenLux API Key: {OPENLUX_API_KEY[:8]}...{OPENLUX_API_KEY[-4:] if len(OPENLUX_API_KEY) > 12 else ''}")
     
     if ALLOWED_USER_IDS:
