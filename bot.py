@@ -1,733 +1,553 @@
-import os
-import sys
-import time
+import base64
 import json
 import logging
-import threading
-import tempfile
+import os
 import re
-import requests
-from typing import Dict, Any, Optional
+import sys
+import tempfile
+import threading
+import time
+from typing import Any, Optional
 
 import telebot
-from telebot.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Message,
-    CallbackQuery
-)
+from telebot.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from config import TELEGRAM_BOT_TOKEN, OPENLUX_API_KEY, OPENLUX_BASE_URL, MODELS, DEFAULT_USER_SETTINGS, ALLOWED_USER_IDS
+from config import (
+    ADMIN_USER_IDS,
+    ALLOWED_USER_IDS,
+    DEFAULT_USER_SETTINGS,
+    GENERATION_TIMEOUT_SECONDS,
+    MAX_CONCURRENT_JOBS,
+    MAX_IMAGE_BYTES,
+    MAX_JOBS_PER_USER,
+    MAX_PROMPT_LENGTH,
+    OPENLUX_API_KEY,
+    OPENLUX_BASE_URL,
+    POLL_INTERVAL_SECONDS,
+    SETTING_OPTIONS,
+    TELEGRAM_BOT_TOKEN,
+    normalized_settings,
+    validate_runtime_config,
+)
 from openlux_client import OpenLuxClient
 
-# Force unbuffered output for live logging
-sys.stdout.reconfigure(line_buffering=True)
 
-# Configure Logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger("OpenLuxBot")
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger("video_bot")
 
-# Initialize OpenLux API Client
+DATA_DIR = os.getenv("BOT_DATA_DIR", ".")
+USER_SETTINGS_FILE = os.path.join(DATA_DIR, "user_settings.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "generation_history.json")
+
+settings_lock = threading.RLock()
+history_lock = threading.RLock()
+job_lock = threading.Lock()
+user_settings: dict[int, dict[str, str]] = {}
+generation_history: list[dict[str, Any]] = []
+active_jobs: dict[int, int] = {}
+
 openlux_client = OpenLuxClient(api_key=OPENLUX_API_KEY, base_url=OPENLUX_BASE_URL)
-
-# Thread Lock for User Settings File
-settings_lock = threading.Lock()
-USER_SETTINGS_FILE = "user_settings.json"
-user_settings: Dict[int, Dict[str, Any]] = {}
-
-def load_user_settings():
-    global user_settings
-    with settings_lock:
-        if os.path.exists(USER_SETTINGS_FILE):
-            try:
-                with open(USER_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    user_settings = {int(k): v for k, v in data.items()}
-            except Exception as e:
-                logger.error(f"Failed to load user settings: {e}")
-
-def save_user_settings():
-    with settings_lock:
-        try:
-            with open(USER_SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(user_settings, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save user settings: {e}")
-
-# Generation History Tracking
-history_lock = threading.Lock()
-HISTORY_FILE = "generation_history.json"
-generation_history = []
-
-def load_history():
-    global generation_history
-    with history_lock:
-        if os.path.exists(HISTORY_FILE):
-            try:
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    generation_history = json.load(f)
-            except Exception as e:
-                logger.error(f"Failed to load generation history: {e}")
-
-def log_generation_event(user_id: int, user_name: str, model_key: str, model_name: str, prompt: str, duration: str, status: str, media_url: str = None):
-    with history_lock:
-        event = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-            "user_id": user_id,
-            "user_name": user_name,
-            "model_key": model_key,
-            "model_name": model_name,
-            "prompt": prompt,
-            "duration": duration,
-            "status": status,
-            "media_url": media_url
-        }
-        generation_history.append(event)
-        try:
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(generation_history[-100:], f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save generation history: {e}")
-
-def get_user_config(user_id: int) -> Dict[str, Any]:
-    with settings_lock:
-        if user_id not in user_settings:
-            user_settings[user_id] = DEFAULT_USER_SETTINGS.copy()
-        else:
-            if user_settings[user_id].get("model") not in MODELS:
-                user_settings[user_id]["model"] = "grok"
-            ar = str(user_settings[user_id].get("aspect_ratio", ""))
-            if ":" not in ar or ar not in ["9:16", "16:9", "1:1"]:
-                user_settings[user_id]["aspect_ratio"] = "9:16"
-    return user_settings[user_id]
-
-# Safe Markdown Escaper for Telegram V1 Markdown
-def escape_markdown(text: str) -> str:
-    """Escapes Telegram Markdown special characters in dynamic text to prevent parse errors."""
-    if not text:
-        return ""
-    for char in ["_", "*", "`", "[", "]"]:
-        text = text.replace(char, f"\\{char}")
-    return text
-
-def format_caption(prompt: str, model_name: str, duration: str, aspect_ratio: str, task_id: str) -> str:
-    """Format Telegram video caption under 1000 chars to avoid API limit errors."""
-    clean_p = escape_markdown(prompt)
-    if len(clean_p) > 700:
-        clean_p = clean_p[:700] + "..."
-    clean_m = escape_markdown(model_name)
-    return f"🎬 *Prompt:* {clean_p}\n🤖 *Model:* {clean_m} ({duration}s | {aspect_ratio})\n🆔 `{task_id}`"
-
-# Validate Token before startup
-if not TELEGRAM_BOT_TOKEN:
-    print("\n⚠️ ERROR: TELEGRAM_BOT_TOKEN is not set.")
-    print("Please set TELEGRAM_BOT_TOKEN in .env or environment variable!\n")
-
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="Markdown") if TELEGRAM_BOT_TOKEN else None
 bot_username = ""
 
-# Access Control Helpers
-def is_user_allowed(user_id: int) -> bool:
-    if not ALLOWED_USER_IDS:
-        return True
-    return user_id in ALLOWED_USER_IDS
 
-def check_access(msg: Message) -> bool:
-    user_id = msg.from_user.id
-    if not is_user_allowed(user_id):
-        deny_text = (
-            f"⛔ *Access Restricted*\n\n"
-            f"Your Telegram User ID is `{user_id}`.\n"
-            f"You are not authorized to use this bot.\n\n"
-            f"Please request an administrator to add your User ID to `ALLOWED_USER_IDS`."
-        )
-        bot.send_message(msg.chat.id, deny_text)
+def _load_json(path: str, fallback: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as source:
+            return json.load(source)
+    except FileNotFoundError:
+        return fallback
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Could not load %s: %s", path, exc)
+        return fallback
+
+
+def _write_json_atomic(path: str, data: Any) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False) as output:
+            temp_path = output.name
+            json.dump(data, output, indent=2, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def load_user_settings() -> None:
+    global user_settings
+    with settings_lock:
+        data = _load_json(USER_SETTINGS_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        user_settings = {
+            int(user_id): normalized_settings(value if isinstance(value, dict) else {})
+            for user_id, value in data.items()
+            if str(user_id).isdigit()
+        }
+
+
+def save_user_settings() -> None:
+    with settings_lock:
+        _write_json_atomic(USER_SETTINGS_FILE, user_settings)
+
+
+def get_user_config(user_id: int) -> dict[str, str]:
+    with settings_lock:
+        current = normalized_settings(user_settings.get(user_id, {}))
+        user_settings[user_id] = current
+        return current.copy()
+
+
+def update_user_setting(user_id: int, key: str, value: str) -> bool:
+    if key not in SETTING_OPTIONS or value not in SETTING_OPTIONS[key]:
         return False
+    with settings_lock:
+        current = normalized_settings(user_settings.get(user_id, {}))
+        current[key] = value
+        user_settings[user_id] = current
+        _write_json_atomic(USER_SETTINGS_FILE, user_settings)
     return True
 
-def safe_edit_message_text(text: str, chat_id: int, message_id: int, reply_markup=None):
-    """Safely edit Telegram message text ignoring 'message is not modified' error."""
+
+def load_history() -> None:
+    global generation_history
+    with history_lock:
+        data = _load_json(HISTORY_FILE, [])
+        generation_history = data if isinstance(data, list) else []
+
+
+def log_generation_event(user_id: int, prompt: str, operation: str, settings: dict, status: str) -> None:
+    event = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "user_id": user_id,
+        "operation": operation,
+        "prompt": prompt[:MAX_PROMPT_LENGTH],
+        "duration": settings["duration"],
+        "aspect_ratio": settings["aspect_ratio"],
+        "resolution": settings["resolution"],
+        "status": status,
+    }
+    with history_lock:
+        generation_history.append(event)
+        del generation_history[:-100]
+        _write_json_atomic(HISTORY_FILE, generation_history)
+
+
+def escape_markdown(text: object) -> str:
+    value = str(text or "")
+    for char in ("_", "*", "`", "[", "]"):
+        value = value.replace(char, f"\\{char}")
+    return value
+
+
+def format_settings(settings: dict[str, str]) -> str:
+    return f"{settings['duration']}s | {settings['aspect_ratio']} | {settings['resolution']}"
+
+
+def format_caption(prompt: str, settings: dict[str, str]) -> str:
+    clean_prompt = escape_markdown(prompt[:700] + ("…" if len(prompt) > 700 else ""))
+    return f"🎬 *Prompt:* {clean_prompt}\n⚙️ *Output:* `{format_settings(settings)}`"
+
+
+def is_user_allowed(user_id: int) -> bool:
+    return bool(ALLOWED_USER_IDS) and user_id in ALLOWED_USER_IDS
+
+
+def is_admin(user_id: int) -> bool:
+    return bool(ADMIN_USER_IDS) and user_id in ADMIN_USER_IDS and is_user_allowed(user_id)
+
+
+def check_access(message: Message) -> bool:
+    if is_user_allowed(message.from_user.id):
+        return True
+    bot.send_message(
+        message.chat.id,
+        "⛔ *Access Restricted*\n\n"
+        f"Your Telegram User ID is `{message.from_user.id}`. Contact an administrator for access.",
+    )
+    return False
+
+
+def _claim_job(user_id: int) -> bool:
+    with job_lock:
+        if sum(active_jobs.values()) >= MAX_CONCURRENT_JOBS:
+            return False
+        if active_jobs.get(user_id, 0) >= MAX_JOBS_PER_USER:
+            return False
+        active_jobs[user_id] = active_jobs.get(user_id, 0) + 1
+        return True
+
+
+def _release_job(user_id: int) -> None:
+    with job_lock:
+        remaining = active_jobs.get(user_id, 0) - 1
+        if remaining > 0:
+            active_jobs[user_id] = remaining
+        else:
+            active_jobs.pop(user_id, None)
+
+
+def safe_edit_message_text(text: str, chat_id: int, message_id: int, reply_markup=None) -> None:
     if not bot:
         return
     try:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
-    except telebot.apihelper.ApiTelegramException as e:
-        if "message is not modified" in str(e):
-            pass
-        else:
-            logger.warning(f"edit_message_text exception: {e}")
-    except Exception as ex:
-        logger.warning(f"edit_message_text exception: {ex}")
+    except telebot.apihelper.ApiTelegramException as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.warning("Could not edit Telegram status message: %s", exc)
+    except Exception as exc:
+        logger.warning("Could not edit Telegram status message: %s", exc)
 
-# Helper UI Keyboards
+
 def get_main_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.row(
         InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-        InlineKeyboardButton("🤖 Select Model", callback_data="menu_models")
+        InlineKeyboardButton("📊 History", callback_data="menu_history"),
     )
-    markup.row(
-        InlineKeyboardButton("📊 History & Usage", callback_data="menu_history"),
-        InlineKeyboardButton("ℹ️ Help & Info", callback_data="menu_info")
-    )
+    markup.add(InlineKeyboardButton("ℹ️ Help", callback_data="menu_info"))
     return markup
+
 
 def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    cfg = get_user_config(user_id)
-    model_key = cfg["model"]
-    model_info = MODELS.get(model_key, MODELS["grok"])
-
+    settings = get_user_config(user_id)
     markup = InlineKeyboardMarkup()
-    
-    # Provider Row
-    markup.add(InlineKeyboardButton(f"🤖 Model: {model_info['name']}", callback_data="menu_models"))
-
-    # Duration Row
-    dur_btn_text = f"⏱️ Duration: {cfg['duration']}s"
-    markup.add(InlineKeyboardButton(dur_btn_text, callback_data="menu_durations"))
-
-    # Aspect Ratio Row
-    ar_btn_text = f"📐 Aspect Ratio: {cfg['aspect_ratio']}"
-    markup.add(InlineKeyboardButton(ar_btn_text, callback_data="menu_ratios"))
-
-    # Resolution Row
-    res_btn_text = f"🖥️ Resolution: {cfg['resolution']}"
-    markup.add(InlineKeyboardButton(res_btn_text, callback_data="menu_resolutions"))
-
-    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="menu_main"))
+    markup.add(InlineKeyboardButton(f"⏱️ Duration: {settings['duration']}s", callback_data="menu_durations"))
+    markup.add(InlineKeyboardButton(f"📐 Format: {settings['aspect_ratio']}", callback_data="menu_ratios"))
+    markup.add(InlineKeyboardButton(f"🖥️ Quality: {settings['resolution']}", callback_data="menu_resolutions"))
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
     return markup
 
-def get_models_keyboard(current_model: str) -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    for m_key, m_info in MODELS.items():
-        prefix = "✅ " if m_key == current_model else ""
-        markup.add(InlineKeyboardButton(f"{prefix}{m_info['name']}", callback_data=f"set_model:{m_key}"))
-    markup.add(InlineKeyboardButton("⬅️ Back to Settings", callback_data="menu_settings"))
-    return markup
 
-def get_durations_keyboard(model_key: str, current_duration: str) -> InlineKeyboardMarkup:
+def _options_keyboard(kind: str, current: str) -> InlineKeyboardMarkup:
+    labels = {"duration": " sec", "aspect_ratio": "", "resolution": ""}
+    callback_names = {"duration": "set_duration", "aspect_ratio": "set_ratio", "resolution": "set_resolution"}
     markup = InlineKeyboardMarkup()
-    model_info = MODELS.get(model_key, MODELS["grok"])
-    durations = model_info.get("durations", ["5", "6", "10"])
-    
-    buttons = []
-    for d in durations:
-        prefix = "✅ " if d == current_duration else ""
-        buttons.append(InlineKeyboardButton(f"{prefix}{d} sec", callback_data=f"set_duration:{d}"))
-    
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✅ ' if value == current else ''}{value}{labels[kind]}",
+            callback_data=f"{callback_names[kind]}:{value}",
+        )
+        for value in SETTING_OPTIONS[kind]
+    ]
     markup.row(*buttons)
-    markup.add(InlineKeyboardButton("⬅️ Back to Settings", callback_data="menu_settings"))
-    return markup
-
-def get_ratios_keyboard(model_key: str, current_ratio: str) -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    model_info = MODELS.get(model_key, MODELS["grok"])
-    ratios = model_info.get("aspect_ratios", ["9:16", "16:9", "1:1"])
-    
-    buttons = []
-    for r in ratios:
-        prefix = "✅ " if r == current_ratio else ""
-        buttons.append(InlineKeyboardButton(f"{prefix}{r}", callback_data=f"set_ratio:{r}"))
-    
-    markup.row(*buttons)
-    markup.add(InlineKeyboardButton("⬅️ Back to Settings", callback_data="menu_settings"))
-    return markup
-
-def get_resolutions_keyboard(model_key: str, current_res: str) -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    model_info = MODELS.get(model_key, MODELS["grok"])
-    res_list = model_info.get("resolutions", ["480p", "720p", "1080p"])
-    
-    buttons = []
-    for res in res_list:
-        prefix = "✅ " if res == current_res else ""
-        buttons.append(InlineKeyboardButton(f"{prefix}{res}", callback_data=f"set_resolution:{res}"))
-    
-    markup.row(*buttons)
-    markup.add(InlineKeyboardButton("⬅️ Back to Settings", callback_data="menu_settings"))
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_settings"))
     return markup
 
 
-# BOT COMMAND HANDLERS
+def settings_text(settings: dict[str, str]) -> str:
+    return (
+        "⚙️ *Video Settings*\n\n"
+        f"• *Duration:* `{settings['duration']} seconds`\n"
+        f"• *Format:* `{settings['aspect_ratio']}`\n"
+        f"• *Quality:* `{settings['resolution']}`\n\n"
+        "Photo animation automatically uses the best compatible rendering route. "
+        "If a chosen option is unavailable for a photo, the bot safely uses the nearest compatible preset."
+    )
+
+
+def history_text() -> str:
+    load_history()
+    with history_lock:
+        if not generation_history:
+            return "📊 *No generation history yet.*"
+        recent = generation_history[-8:]
+        text = f"📊 *Team Generation Log ({len(generation_history)} jobs)*\n\n"
+        for item in reversed(recent):
+            icon = "✅" if item.get("status") == "success" else "❌"
+            operation = "Photo animation" if item.get("operation") == "photo" else "Text video"
+            prompt = escape_markdown(item.get("prompt", ""))[:45]
+            text += f"{icon} *{operation}* ({item.get('duration', '?')}s)\n  └ `{prompt}…` [{item.get('timestamp', '')}]\n"
+        return text
+
+
 if bot:
-    # Public ID check command (Always accessible)
     @bot.message_handler(commands=["id", "myid"])
-    def cmd_myid(msg: Message):
-        bot.send_message(msg.chat.id, f"🆔 *Your Telegram User ID:* `{msg.from_user.id}`")
+    def cmd_myid(message: Message):
+        bot.send_message(message.chat.id, f"🆔 *Your Telegram User ID:* `{message.from_user.id}`")
 
     @bot.message_handler(commands=["start", "help"])
-    def cmd_start(msg: Message):
-        if not check_access(msg): return
-        load_user_settings()
-        cfg = get_user_config(msg.from_user.id)
-        m_name = MODELS.get(cfg["model"], {}).get("name", "xAI Grok Imagine Video")
-        
-        welcome_text = (
-            "🎥 *Welcome to Team AI Video Generator!*\n\n"
-            "Generate flagship AI videos directly in Telegram:\n"
-            "• *xAI Grok Imagine Video*\n"
-            "• *Kuaishou Kling 3.0 Turbo* (Text & Photo-to-Video)\n\n"
-            f"⚙️ *Active Preset:* `{escape_markdown(m_name)}` ({cfg['duration']}s | {cfg['aspect_ratio']} | {cfg['resolution']})\n\n"
-            "💡 *How to use:*\n"
-            "1. Simply *type any video prompt* (e.g. `A drone shot over mountain peaks at sunset`) and hit send!\n"
-            "2. Or *send a photo with a caption* to animate it into a video using Kling 3.0!\n"
-            "3. Use `/settings` to adjust model, duration (seconds), resolution & aspect ratio."
+    def cmd_start(message: Message):
+        if not check_access(message):
+            return
+        settings = get_user_config(message.from_user.id)
+        text = (
+            "🎥 *Team Video Studio*\n\n"
+            "Create a video by sending a detailed text prompt, or animate a photo by sending it with a caption.\n\n"
+            f"⚙️ *Current output:* `{format_settings(settings)}`\n\n"
+            "Use /settings to change duration, format, or quality."
         )
-        bot.send_message(msg.chat.id, welcome_text, reply_markup=get_main_keyboard())
+        bot.send_message(message.chat.id, text, reply_markup=get_main_keyboard())
 
     @bot.message_handler(commands=["settings"])
-    def cmd_settings(msg: Message):
-        if not check_access(msg): return
-        user_id = msg.from_user.id
-        cfg = get_user_config(user_id)
-        m_info = MODELS.get(cfg["model"], MODELS["grok"])
-        text = (
-            "⚙️ *Video Generation Settings*\n\n"
-            f"• *Model:* `{escape_markdown(m_info['name'])}`\n"
-            f"• *Duration:* `{cfg['duration']} seconds`\n"
-            f"• *Aspect Ratio:* `{cfg['aspect_ratio']}`\n"
-            f"• *Resolution:* `{cfg['resolution']}`\n\n"
-            "Tap any button below to adjust your parameters:"
-        )
-        bot.send_message(msg.chat.id, text, reply_markup=get_settings_keyboard(user_id))
-
-    @bot.message_handler(commands=["models"])
-    def cmd_models(msg: Message):
-        if not check_access(msg): return
-        text = "🤖 *Available AI Video Models:*\n\n"
-        for k, info in MODELS.items():
-            text += f"• *{escape_markdown(info['name'])}*\n"
-        text += "\nUse `/settings` to switch your active model."
-        bot.send_message(msg.chat.id, text)
+    def cmd_settings(message: Message):
+        if check_access(message):
+            settings = get_user_config(message.from_user.id)
+            bot.send_message(message.chat.id, settings_text(settings), reply_markup=get_settings_keyboard(message.from_user.id))
 
     @bot.message_handler(commands=["generate"])
-    def cmd_generate(msg: Message):
-        if not check_access(msg): return
-        prompt = msg.text.replace("/generate", "").strip()
-        if not prompt or len(prompt) < 3:
-            bot.send_message(msg.chat.id, "⚠️ *Please provide a clear prompt after /generate.*\nExample: `/generate A drone shot over snowy mountain peaks`")
+    def cmd_generate(message: Message):
+        if not check_access(message):
             return
-        handle_generation_request(msg.chat.id, msg.from_user.id, prompt, image_url=None)
-
-    # Admin Team User Whitelist Commands
-    @bot.message_handler(commands=["addid"])
-    def cmd_addid(msg: Message):
-        if not check_access(msg): return
-        args = msg.text.replace("/addid", "").strip()
-        if not args or not args.isdigit():
-            bot.send_message(msg.chat.id, "⚠️ *Usage:* `/addid <telegram_user_id>`\nExample: `/addid 123456789`")
+        prompt = re.sub(r"^/generate(?:@\w+)?", "", message.text or "", flags=re.IGNORECASE).strip()
+        if len(prompt) < 3:
+            bot.send_message(message.chat.id, "⚠️ Add a clear prompt after /generate.")
             return
-        new_id = int(args)
-        if new_id not in ALLOWED_USER_IDS:
-            ALLOWED_USER_IDS.append(new_id)
-            env_str = ",".join(map(str, ALLOWED_USER_IDS))
-            try:
-                env_path = ".env"
-                if os.path.exists(env_path):
-                    with open(env_path, "r") as f:
-                        lines = f.readlines()
-                    with open(env_path, "w") as f:
-                        for line in lines:
-                            if line.startswith("ALLOWED_USER_IDS="):
-                                f.write(f'ALLOWED_USER_IDS="{env_str}"\n')
-                            else:
-                                f.write(line)
-            except Exception as e:
-                logger.error(f"Failed to update .env: {e}")
-            bot.send_message(msg.chat.id, f"✅ User ID `{new_id}` added to authorized team whitelist!")
-        else:
-            bot.send_message(msg.chat.id, f"ℹ️ User ID `{new_id}` is already in the whitelist.")
+        handle_generation_request(message.chat.id, message.from_user.id, prompt)
 
     @bot.message_handler(commands=["usage", "history"])
-    def cmd_usage(msg: Message):
-        if not check_access(msg): return
-        load_history()
-        with history_lock:
-            if not generation_history:
-                bot.send_message(msg.chat.id, "📊 *No generation history recorded yet.*\nStart generating videos to log usage!")
+    def cmd_usage(message: Message):
+        if check_access(message):
+            bot.send_message(message.chat.id, history_text())
+
+    @bot.message_handler(commands=["addid", "listusers"])
+    def cmd_admin(message: Message):
+        if not check_access(message):
+            return
+        if not is_admin(message.from_user.id):
+            bot.send_message(message.chat.id, "⛔ This command is restricted to bot administrators.")
+            return
+        if (message.text or "").split()[0].lower().startswith("/listusers"):
+            users = "\n".join(f"• `{user_id}`" for user_id in ALLOWED_USER_IDS)
+            bot.send_message(message.chat.id, f"🔒 *Authorized Team Members*\n\n{users}")
+            return
+        bot.send_message(message.chat.id, "ℹ️ Update `ALLOWED_USER_IDS` in the deployment environment and restart the bot. Runtime secret files are not modified from Telegram.")
+
+    @bot.message_handler(content_types=["photo"])
+    def handle_photo(message: Message):
+        caption = (message.caption or "").strip()
+        if message.chat.type in ("group", "supergroup"):
+            mention = f"@{bot_username}" if bot_username else ""
+            if not mention or mention.lower() not in caption.lower():
                 return
-            
-            total_jobs = len(generation_history)
-            recent = generation_history[-8:]
-            
-            history_text = f"📊 *Team Generation Log ({total_jobs} Total Jobs)*\n\n*Recent Generations:*\n"
-            for item in reversed(recent):
-                status_icon = "✅" if item.get("status") == "success" else "❌"
-                clean_p = escape_markdown(item.get("prompt", ""))[:40]
-                clean_m = escape_markdown(item.get("model_name", ""))
-                clean_u = escape_markdown(item.get("user_name", str(item.get("user_id"))))
-                history_text += f"{status_icon} *{clean_m}* ({item.get('duration')}s) — ID: `{clean_u}`\n  └ `\"{clean_p}...\"` [{item.get('timestamp')}]\n"
-            
-            bot.send_message(msg.chat.id, history_text)
-
-    @bot.message_handler(commands=["listusers"])
-    def cmd_listusers(msg: Message):
-        if not check_access(msg): return
-        if not ALLOWED_USER_IDS:
-            bot.send_message(msg.chat.id, "🔓 *Access Mode:* Unrestricted (Any user can access).")
-        else:
-            users_str = "\n".join([f"• `{uid}`" for uid in ALLOWED_USER_IDS])
-            bot.send_message(msg.chat.id, f"🔒 *Authorized Team User IDs:*\n\n{users_str}")
-
-    # Photo Message Handler (Image to Video)
-    @bot.message_handler(content_types=['photo'])
-    def handle_photo(msg: Message):
-        if not check_access(msg): return
-        caption = msg.caption or "Animate this photo with natural dynamic motion"
-        chat_id = msg.chat.id
-        user_id = msg.from_user.id
-
-        cfg = get_user_config(user_id)
-        current_model = cfg["model"]
-        model_info = MODELS.get(current_model, MODELS["grok"])
-
-        # Determine target model for Image-to-Video without overwriting user's default setting
-        target_model = current_model
-        notice_prefix = ""
-        if not model_info.get("supports_image"):
-            target_model = "kling"
-            notice_prefix = "ℹ️ *Notice:* Photos require an Image-to-Video model. Animating photo using *Kuaishou Kling 3.0 Turbo* (your default active model remains unchanged).\n\n"
-
-        status_msg = bot.send_message(chat_id, f"{notice_prefix}📤 *Processing photo for API...*")
+            caption = re.sub(re.escape(mention), "", caption, flags=re.IGNORECASE).strip()
+        if not check_access(message):
+            return
+        prompt = caption or "Animate this photo with natural, realistic motion"
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            bot.send_message(message.chat.id, f"⚠️ Caption is too long. Keep it under {MAX_PROMPT_LENGTH} characters.")
+            return
+        status = bot.send_message(message.chat.id, "📤 *Preparing your photo…*")
         try:
-            file_info = bot.get_file(msg.photo[-1].file_id)
-            img_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
-            
-            safe_edit_message_text("✅ *Photo ready! Launching Image-to-Video generation...*", chat_id, status_msg.message_id)
-            handle_generation_request(chat_id, user_id, caption, image_url=img_url, status_msg_id=status_msg.message_id, override_model=target_model)
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ Error handling photo: {escape_markdown(str(e))}")
-
-    # Text Message Handler (Direct Prompts with Group Chat Intelligence)
-    @bot.message_handler(func=lambda msg: True)
-    def handle_text(msg: Message):
-        if msg.text.startswith("/"):
-            return
-        if not check_access(msg): return
-
-        chat_type = msg.chat.type
-        text = msg.text.strip()
-
-        # Filtering conversational short greetings or non-prompts in private chats
-        conversational_words = ["hi", "hello", "hey", "hola", "ok", "okay", "thanks", "thank you", "cool", "help"]
-        if text.lower() in conversational_words or len(text) < 3:
-            bot.send_message(
-                msg.chat.id,
-                "👋 *Hello!* Enter any video prompt below to generate an AI video.\n"
-                "Example: `A futuristic cyberpunk cat running in rain`"
+            file_info = bot.get_file(message.photo[-1].file_id)
+            image_bytes = bot.download_file(file_info.file_path)
+            if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+                raise ValueError("Photo is too large")
+            # Kling-compatible APIs expect raw Base64 in the image field (no data-URI prefix).
+            image_data = base64.b64encode(image_bytes).decode("ascii")
+            handle_generation_request(
+                message.chat.id,
+                message.from_user.id,
+                prompt,
+                image_data=image_data,
+                status_msg_id=status.message_id,
             )
+        except Exception as exc:
+            logger.warning("Photo preparation failed for user %s: %s", message.from_user.id, exc)
+            safe_edit_message_text("❌ *Could not prepare that photo.* Please try a smaller JPG or PNG.", message.chat.id, status.message_id)
+
+    @bot.message_handler(content_types=["text"])
+    def handle_text(message: Message):
+        text = (message.text or "").strip()
+        if text.startswith("/"):
             return
-
-        # In Group or Supergroup chats, only trigger if bot is mentioned or prompt starts with /generate
-        if chat_type in ["group", "supergroup"]:
-            if bot_username and f"@{bot_username.lower()}" in text.lower():
-                prompt = re.sub(f"@{bot_username}", "", text, flags=re.IGNORECASE).strip()
-                if prompt:
-                    handle_generation_request(msg.chat.id, msg.from_user.id, prompt, image_url=None)
+        if message.chat.type in ("group", "supergroup"):
+            mention = f"@{bot_username}" if bot_username else ""
+            if not mention or mention.lower() not in text.lower():
+                return
+            text = re.sub(re.escape(mention), "", text, flags=re.IGNORECASE).strip()
+        if not check_access(message):
             return
+        if text.lower() in {"hi", "hello", "hey", "ok", "okay", "thanks", "thank you", "help"} or len(text) < 3:
+            bot.send_message(message.chat.id, "👋 Send a detailed video prompt, or use /help.")
+            return
+        handle_generation_request(message.chat.id, message.from_user.id, text)
 
-        # Private Chat: Direct prompt execution
-        handle_generation_request(msg.chat.id, msg.from_user.id, text, image_url=None)
-
-
-# CALLBACK QUERY HANDLER (Interactive Menu Buttons)
-if bot:
     @bot.callback_query_handler(func=lambda call: True)
     def handle_callbacks(call: CallbackQuery):
-        user_id = call.from_user.id
-        if not is_user_allowed(user_id):
-            bot.answer_callback_query(call.id, "Access restricted for your Telegram User ID", show_alert=True)
+        if not is_user_allowed(call.from_user.id):
+            bot.answer_callback_query(call.id, "Access restricted", show_alert=True)
             return
-
-        cfg = get_user_config(user_id)
-        data = call.data
-
+        settings = get_user_config(call.from_user.id)
+        data = call.data or ""
+        markup = None
+        text = ""
         if data == "menu_main":
-            m_name = MODELS.get(cfg["model"], {}).get("name", "xAI Grok Imagine Video")
-            text = (
-                "🎥 *Team AI Video Generator*\n\n"
-                f"⚙️ *Active Model:* `{escape_markdown(m_name)}`\n"
-                f"⏱️ `{cfg['duration']}s` | 📐 `{cfg['aspect_ratio']}` | 🖥️ `{cfg['resolution']}`"
-            )
-            safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=get_main_keyboard())
-
+            text = f"🎥 *Team Video Studio*\n\n⚙️ *Current output:* `{format_settings(settings)}`"
+            markup = get_main_keyboard()
         elif data == "menu_settings":
-            m_info = MODELS.get(cfg["model"], MODELS["grok"])
-            text = (
-                "⚙️ *Video Generation Settings*\n\n"
-                f"• *Model:* `{escape_markdown(m_info['name'])}`\n"
-                f"• *Duration:* `{cfg['duration']} seconds`\n"
-                f"• *Aspect Ratio:* `{cfg['aspect_ratio']}`\n"
-                f"• *Resolution:* `{cfg['resolution']}`\n\n"
-                "Tap any button below to adjust your settings:"
-            )
-            safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
-
+            text, markup = settings_text(settings), get_settings_keyboard(call.from_user.id)
         elif data == "menu_history":
-            load_history()
-            with history_lock:
-                if not generation_history:
-                    text = "📊 *No generation history recorded yet.*"
-                else:
-                    total_jobs = len(generation_history)
-                    recent = generation_history[-8:]
-                    text = f"📊 *Team Generation Log ({total_jobs} Total Jobs)*\n\n*Recent Generations:*\n"
-                    for item in reversed(recent):
-                        status_icon = "✅" if item.get("status") == "success" else "❌"
-                        clean_p = escape_markdown(item.get("prompt", ""))[:40]
-                        clean_m = escape_markdown(item.get("model_name", ""))
-                        clean_u = escape_markdown(item.get("user_name", str(item.get("user_id"))))
-                        text += f"{status_icon} *{clean_m}* ({item.get('duration')}s) — ID: `{clean_u}`\n  └ `\"{clean_p}...\"` [{item.get('timestamp')}]\n"
+            text = history_text()
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
-            safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-        elif data == "menu_models":
-            safe_edit_message_text("🤖 *Select AI Video Model:*", call.message.chat.id, call.message.message_id, reply_markup=get_models_keyboard(cfg["model"]))
-
-        elif data.startswith("set_model:"):
-            m_key = data.split(":", 1)[1]
-            if m_key in MODELS:
-                cfg["model"] = m_key
-                m_info = MODELS[m_key]
-                if "durations" in m_info and cfg["duration"] not in m_info["durations"]:
-                    cfg["duration"] = m_info.get("default_duration", m_info["durations"][0])
-                if "aspect_ratios" in m_info and cfg["aspect_ratio"] not in m_info["aspect_ratios"]:
-                    cfg["aspect_ratio"] = m_info.get("default_aspect_ratio", "9:16")
-                if "resolutions" in m_info and cfg["resolution"] not in m_info["resolutions"]:
-                    cfg["resolution"] = m_info.get("default_resolution", m_info["resolutions"][0])
-                save_user_settings()
-                bot.answer_callback_query(call.id, f"Model set to {m_info['name']}")
-                safe_edit_message_text(f"✅ Provider set to *{escape_markdown(m_info['name'])}*", call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
-
-        elif data == "menu_durations":
-            safe_edit_message_text("⏱️ *Select Video Duration:*", call.message.chat.id, call.message.message_id, reply_markup=get_durations_keyboard(cfg["model"], cfg["duration"]))
-
-        elif data.startswith("set_duration:"):
-            dur = data.split(":", 1)[1]
-            cfg["duration"] = dur
-            save_user_settings()
-            bot.answer_callback_query(call.id, f"Duration set to {dur}s")
-            safe_edit_message_text(f"✅ Duration set to *{dur}s*", call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
-
-        elif data == "menu_ratios":
-            safe_edit_message_text("📐 *Select Aspect Ratio:*", call.message.chat.id, call.message.message_id, reply_markup=get_ratios_keyboard(cfg["model"], cfg["aspect_ratio"]))
-
-        elif data.startswith("set_ratio:"):
-            ratio = data.split(":", 1)[1]
-            cfg["aspect_ratio"] = ratio
-            save_user_settings()
-            bot.answer_callback_query(call.id, f"Aspect Ratio set to {ratio}")
-            safe_edit_message_text(f"✅ Aspect Ratio set to *{ratio}*", call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
-
-        elif data == "menu_resolutions":
-            safe_edit_message_text("🖥️ *Select Video Resolution:*", call.message.chat.id, call.message.message_id, reply_markup=get_resolutions_keyboard(cfg["model"], cfg["resolution"]))
-
-        elif data.startswith("set_resolution:"):
-            res = data.split(":", 1)[1]
-            cfg["resolution"] = res
-            save_user_settings()
-            bot.answer_callback_query(call.id, f"Resolution set to {res}")
-            safe_edit_message_text(f"✅ Resolution set to *{res}*", call.message.chat.id, call.message.message_id, reply_markup=get_settings_keyboard(user_id))
-
         elif data == "menu_info":
-            info_text = (
-                "ℹ️ *Video Model Capabilities*\n\n"
-                "• *xAI Grok Imagine Video:* Fastest & highly cinematic text-to-video generation.\n"
-                "• *Kuaishou Kling 3.0 Turbo:* High HD realism. Supports Text & Photo-to-Video."
-            )
+            text = "ℹ️ *How it works*\n\nSend text to create a new video. Send a photo with a caption to animate it. Rendering routes are selected automatically."
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
-            safe_edit_message_text(info_text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        elif data == "menu_durations":
+            text, markup = "⏱️ *Select duration:*", _options_keyboard("duration", settings["duration"])
+        elif data == "menu_ratios":
+            text, markup = "📐 *Select format:*", _options_keyboard("aspect_ratio", settings["aspect_ratio"])
+        elif data == "menu_resolutions":
+            text, markup = "🖥️ *Select quality:*", _options_keyboard("resolution", settings["resolution"])
+        else:
+            callback_map = {"set_duration": "duration", "set_ratio": "aspect_ratio", "set_resolution": "resolution"}
+            prefix, separator, value = data.partition(":")
+            key = callback_map.get(prefix) if separator else None
+            if not key or not update_user_setting(call.from_user.id, key, value):
+                bot.answer_callback_query(call.id, "Invalid setting", show_alert=True)
+                return
+            settings = get_user_config(call.from_user.id)
+            text, markup = "✅ *Settings updated*\n\n" + settings_text(settings), get_settings_keyboard(call.from_user.id)
+        bot.answer_callback_query(call.id)
+        safe_edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
 
-# ASYNCHRONOUS GENERATION & POLLING ENGINE
-def handle_generation_request(chat_id: int, user_id: int, prompt: str, image_url: str = None, status_msg_id: int = None, override_model: Optional[str] = None):
-    cfg = get_user_config(user_id)
-    model_key = override_model if override_model else cfg["model"]
-    model_info = MODELS.get(model_key, MODELS["grok"])
-
-    clean_prompt = escape_markdown(prompt)
-    clean_model_name = escape_markdown(model_info['name'])
-
-    # Initial status message
-    status_text = (
-        f"🎬 *Submitting Video Task...*\n\n"
-        f"• *Prompt:* `{clean_prompt}`\n"
-        f"• *Model:* `{clean_model_name}`\n"
-        f"• *Params:* `{cfg['duration']}s` | `{cfg['aspect_ratio']}` | `{cfg['resolution']}`\n"
-        f"{"• *Image Source:* Attached Photo\n" if image_url else ""}"
-        f"⏳ Please wait..."
-    )
-
-    if status_msg_id:
-        try:
-            bot.edit_message_text(status_text, chat_id, status_msg_id)
-            msg_id = status_msg_id
-        except Exception:
-            msg = bot.send_message(chat_id, status_text)
-            msg_id = msg.message_id
-    else:
-        msg = bot.send_message(chat_id, status_text)
-        msg_id = msg.message_id
-
-    # Launch generation in background thread
-    t = threading.Thread(
-        target=_worker_generation_task,
-        args=(chat_id, user_id, prompt, model_key, cfg, image_url, msg_id)
-    )
-    t.daemon = True
-    t.start()
-
-
-def _worker_generation_task(chat_id: int, user_id: int, prompt: str, model_key: str, cfg: dict, image_url: str, msg_id: int):
-    model_info = MODELS[model_key]
-    clean_prompt = escape_markdown(prompt)
-    clean_model_name = escape_markdown(model_info['name'])
-
-    ok, result = openlux_client.create_generation_task(
-        model_key=model_key,
-        prompt=prompt,
-        duration=cfg["duration"],
-        aspect_ratio=cfg["aspect_ratio"],
-        resolution=cfg["resolution"],
-        image_url=image_url
-    )
-
-    if not ok:
-        raw_err = str(result.get("error", "Unknown error"))
-        safe_edit_message_text(
-            f"❌ *Task Submission Failed*\n\n`{escape_markdown(raw_err)}`",
-            chat_id, msg_id
-        )
+def handle_generation_request(
+    chat_id: int,
+    user_id: int,
+    prompt: str,
+    image_data: Optional[str] = None,
+    status_msg_id: Optional[int] = None,
+) -> None:
+    prompt = prompt.strip()
+    if len(prompt) < 3 or len(prompt) > MAX_PROMPT_LENGTH:
+        bot.send_message(chat_id, f"⚠️ Prompts must be between 3 and {MAX_PROMPT_LENGTH} characters.")
+        return
+    if not _claim_job(user_id):
+        text = "⏳ The studio is at capacity, or you already have a video rendering. Please try again shortly."
+        if status_msg_id:
+            safe_edit_message_text(text, chat_id, status_msg_id)
+        else:
+            bot.send_message(chat_id, text)
         return
 
-    task_id = result["task_id"]
-    endpoint_type = result["endpoint_type"]
-
-    start_time = time.time()
-    poll_count = 0
-
-    while True:
-        poll_count += 1
-        elapsed = int(time.time() - start_time)
-
-        # Update Telegram status message every 10 seconds
-        if poll_count % 2 == 0:
-            safe_edit_message_text(
-                f"⏳ *Generating Video...* [{elapsed}s elapsed]\n\n"
-                f"• *Model:* `{clean_model_name}`\n"
-                f"• *Task ID:* `{task_id}`\n"
-                f"• *Prompt:* `{clean_prompt}`\n\n"
-                f"_Polling GPU status..._",
-                chat_id, msg_id
-            )
-
-        state, media_url, err = openlux_client.poll_task_status(task_id, endpoint_type)
-
-        if state == "success" and media_url:
-            log_generation_event(user_id, str(user_id), model_key, model_info['name'], prompt, cfg['duration'], "success", media_url)
-            safe_edit_message_text(f"🎉 *Video Generation Complete!* [{elapsed}s]\nDownloading & sending MP4 video...", chat_id, msg_id)
-            
-            # Send video directly into Telegram chat with size handling
-            video_sent = False
-            video_caption = format_caption(prompt, model_info['name'], cfg['duration'], cfg['aspect_ratio'], task_id)
-            
-            try:
-                bot.send_video(
-                    chat_id,
-                    media_url,
-                    caption=video_caption,
-                    supports_streaming=True
-                )
-                video_sent = True
-            except Exception as e:
-                logger.warning(f"Direct video send failed ({e}), downloading stream...")
-                try:
-                    headers = {}
-                    if "api.openlux.ai" in media_url:
-                        headers["Authorization"] = f"Bearer {OPENLUX_API_KEY}"
-                    r = requests.get(media_url, headers=headers, stream=True, timeout=60)
-                    file_size = int(r.headers.get("content-length", 0))
-                    
-                    if file_size > 50 * 1024 * 1024:
-                        raise ValueError(f"File size {file_size / (1024*1024):.1f}MB exceeds Telegram limit (50MB).")
-
-                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            tmp.write(chunk)
-                        tmp_path = tmp.name
-                    
-                    with open(tmp_path, "rb") as video_file:
-                        bot.send_video(
-                            chat_id,
-                            video_file,
-                            caption=video_caption,
-                            supports_streaming=True
-                        )
-                    os.remove(tmp_path)
-                    video_sent = True
-                except Exception as ex:
-                    logger.warning(f"Local stream send failed: {ex}")
-
-            if not video_sent:
-                bot.send_message(
-                    chat_id,
-                    f"✅ *Video Generation Complete!*\n\n🎬 *Prompt:* {clean_prompt}\n🔗 [Click Here to View Video]({media_url})"
-                )
-            break
-
-        elif state == "failed":
-            log_generation_event(user_id, str(user_id), model_key, model_info['name'], prompt, cfg['duration'], "failed")
-            clean_err = escape_markdown(str(err or 'Task was rejected or encountered GPU rendering error.'))
-            safe_edit_message_text(
-                f"❌ *Video Generation Failed*\n\n`{clean_err}`",
-                chat_id, msg_id
-            )
-            break
-
-        elif state == "error":
-            logger.warning(f"Poll error for {task_id}: {err}")
-
-        # Timeout safety (5 minutes)
-        if elapsed > 300:
-            safe_edit_message_text(
-                f"⏱️ *Generation Timed Out (5 mins)*\nTask ID: `{task_id}`.",
-                chat_id, msg_id
-            )
-            break
-
-        time.sleep(5)
-
-
-def main():
-    global bot_username
-    load_user_settings()
-    if not TELEGRAM_BOT_TOKEN:
-        print("\n❌ Error: TELEGRAM_BOT_TOKEN is required to run the bot.")
-        print("Set TELEGRAM_BOT_TOKEN in .env file or environment variable!\n")
-        sys.exit(1)
-
+    route = "kling" if image_data else "grok"
+    settings = normalized_settings(get_user_config(user_id), route=route)
+    status_text = (
+        "🎬 *Video request accepted*\n\n"
+        f"• *Prompt:* `{escape_markdown(prompt[:500])}`\n"
+        f"• *Output:* `{format_settings(settings)}`\n"
+        f"• *Source:* `{'Attached photo' if image_data else 'Text prompt'}`\n\n"
+        "⏳ Rendering has started."
+    )
     try:
-        me = bot.get_me()
-        bot_username = me.username
-        print(f"🤖 Telegram Bot Authenticated: @{bot_username}")
-    except Exception as e:
-        print(f"⚠️ Telegram bot auth warning: {e}")
+        if status_msg_id:
+            safe_edit_message_text(status_text, chat_id, status_msg_id)
+            message_id = status_msg_id
+        else:
+            message_id = bot.send_message(chat_id, status_text).message_id
+        worker = threading.Thread(
+            target=_worker_generation_task,
+            args=(chat_id, user_id, prompt, route, settings, image_data, message_id),
+            daemon=True,
+            name=f"video-job-{user_id}",
+        )
+        worker.start()
+    except Exception:
+        _release_job(user_id)
+        raise
 
-    print("🚀 Starting Team AI Video Generator Telegram Bot...")
-    print(f"🔑 Using OpenLux API Key: {OPENLUX_API_KEY[:8]}...{OPENLUX_API_KEY[-4:] if len(OPENLUX_API_KEY) > 12 else ''}")
-    
-    if ALLOWED_USER_IDS:
-        print(f"🔒 Access Restricted to Telegram User IDs: {ALLOWED_USER_IDS}")
-    else:
-        print("🔓 Access Mode: Unrestricted (Open to any user)")
 
-    print("🤖 Telegram Bot Polling Active! Listening for user commands...")
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+def _worker_generation_task(
+    chat_id: int,
+    user_id: int,
+    prompt: str,
+    route: str,
+    settings: dict[str, str],
+    image_data: Optional[str],
+    message_id: int,
+) -> None:
+    operation = "photo" if image_data else "text"
+    try:
+        ok, result = openlux_client.create_generation_task(
+            model_key=route,
+            prompt=prompt,
+            duration=settings["duration"],
+            aspect_ratio=settings["aspect_ratio"],
+            resolution=settings["resolution"],
+            image_data=image_data,
+        )
+        image_data = None
+        if not ok:
+            logger.warning("Submission failed for user %s: %s", user_id, result.get("error"))
+            log_generation_event(user_id, prompt, operation, settings, "failed")
+            safe_edit_message_text("❌ *Could not start this video.* Please try again in a few minutes.", chat_id, message_id)
+            return
+
+        task_id = result["task_id"]
+        endpoint_type = result["endpoint_type"]
+        settings = result.get("settings", settings)
+        started_at = time.monotonic()
+        next_status_update = 20
+        consecutive_poll_errors = 0
+
+        while time.monotonic() - started_at <= GENERATION_TIMEOUT_SECONDS:
+            state, media_url, error = openlux_client.poll_task_status(task_id, endpoint_type)
+            elapsed = int(time.monotonic() - started_at)
+            if state == "success" and media_url:
+                safe_edit_message_text("✅ *Video ready.* Preparing delivery…", chat_id, message_id)
+                temp_path = ""
+                try:
+                    temp_path = openlux_client.download_video(media_url)
+                    with open(temp_path, "rb") as video_file:
+                        bot.send_video(chat_id, video_file, caption=format_caption(prompt, settings), supports_streaming=True, timeout=120)
+                    log_generation_event(user_id, prompt, operation, settings, "success")
+                    safe_edit_message_text("🎉 *Video delivered successfully.*", chat_id, message_id)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                return
+            if state == "failed":
+                logger.warning("Provider generation failed: task=%s error=%s", task_id, error)
+                log_generation_event(user_id, prompt, operation, settings, "failed")
+                safe_edit_message_text("❌ *This video could not be generated.* Try adjusting the prompt or settings.", chat_id, message_id)
+                return
+            if state == "error":
+                consecutive_poll_errors += 1
+                logger.warning("Polling error: task=%s attempt=%s error=%s", task_id, consecutive_poll_errors, error)
+                if consecutive_poll_errors >= 8:
+                    log_generation_event(user_id, prompt, operation, settings, "failed")
+                    safe_edit_message_text("⚠️ *Rendering status is temporarily unavailable.* Please try again later.", chat_id, message_id)
+                    return
+            else:
+                consecutive_poll_errors = 0
+            if elapsed >= next_status_update:
+                safe_edit_message_text(f"⏳ *Rendering your video…* `{elapsed}s elapsed`\n\nYou can continue using Telegram while this finishes.", chat_id, message_id)
+                next_status_update += 30
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+        log_generation_event(user_id, prompt, operation, settings, "failed")
+        safe_edit_message_text("⏱️ *Rendering took longer than expected.* Please try again later.", chat_id, message_id)
+    except Exception as exc:
+        logger.exception("Unhandled generation worker error for user %s: %s", user_id, exc)
+        log_generation_event(user_id, prompt, operation, settings, "failed")
+        safe_edit_message_text("❌ *Delivery failed unexpectedly.* Please try again in a few minutes.", chat_id, message_id)
+    finally:
+        _release_job(user_id)
+
+
+def main() -> None:
+    global bot_username
+    missing = validate_runtime_config()
+    if missing:
+        logger.critical("Refusing to start; missing required configuration: %s", ", ".join(missing))
+        sys.exit(1)
+    load_user_settings()
+    load_history()
+    try:
+        bot_username = bot.get_me().username or ""
+    except Exception as exc:
+        logger.warning("Telegram authentication check failed; polling will retry: %s", exc)
+    logger.info("Starting Team Video Studio for %d allowed users", len(ALLOWED_USER_IDS))
+    bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
+
 
 if __name__ == "__main__":
     main()

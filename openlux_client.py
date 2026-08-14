@@ -1,19 +1,59 @@
+import logging
 import os
-import sys
-import time
+import re
+import tempfile
+from typing import Any, Optional, Tuple
+
 import requests
-import json
-from typing import Dict, Any, Optional, Tuple
-from config import OPENLUX_API_KEY, OPENLUX_BASE_URL, MODELS
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from config import MAX_VIDEO_BYTES, MODELS, OPENLUX_API_KEY, OPENLUX_BASE_URL, normalized_settings
+
+
+logger = logging.getLogger(__name__)
+_SECRET_PATTERN = re.compile(r"(?:sk|kie)-[A-Za-z0-9_-]+")
+
+
+def _safe_error(message: object) -> str:
+    return _SECRET_PATTERN.sub("[redacted]", str(message))[:1000]
+
 
 class OpenLuxClient:
-    def __init__(self, api_key: str = OPENLUX_API_KEY, base_url: str = OPENLUX_BASE_URL):
-        self.api_key = api_key or os.getenv("OPENLUX_API_KEY", OPENLUX_API_KEY)
-        self.base_url = base_url.rstrip('/')
+    def __init__(
+        self,
+        api_key: str = OPENLUX_API_KEY,
+        base_url: str = OPENLUX_BASE_URL,
+        session: Optional[requests.Session] = None,
+    ):
+        self.api_key = api_key.strip()
+        self.base_url = base_url.rstrip("/")
+        self.session = session or requests.Session()
+        retry = Retry(
+            total=4,
+            connect=4,
+            read=3,
+            status=4,
+            backoff_factor=0.8,
+            status_forcelist=(408, 429, 500, 502, 503, 504),
+            allowed_methods=frozenset(("GET",)),
+            respect_retry_after_header=True,
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
+
+    @staticmethod
+    def _json(response: requests.Response) -> dict[str, Any]:
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ValueError("Provider returned an invalid response") from exc
+        if not isinstance(data, dict):
+            raise ValueError("Provider returned an unexpected response")
+        return data
 
     def create_generation_task(
         self,
@@ -22,141 +62,126 @@ class OpenLuxClient:
         duration: str = "5",
         aspect_ratio: str = "9:16",
         resolution: str = "720p",
-        image_url: Optional[str] = None
-    ) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Create a video generation job on OpenLux API (Grok Imagine Video or Kling 3.0 Turbo).
-        Returns (success, result_dict_or_error).
-        """
+        image_data: Optional[str] = None,
+    ) -> Tuple[bool, dict[str, Any]]:
         if model_key not in MODELS:
-            model_key = "grok"
+            return False, {"error": "Unsupported generation route"}
 
-        model_config = MODELS[model_key]
-        endpoint_type = model_config["endpoint_type"]
-        dur_int = int(duration) if str(duration).isdigit() else 5
+        cfg = normalized_settings(
+            {"duration": duration, "aspect_ratio": aspect_ratio, "resolution": resolution},
+            route=model_key,
+        )
+        model = MODELS[model_key]
+        duration_value = int(cfg["duration"])
 
-        # 1. Grok Imagine Video
-        if endpoint_type == "grok":
+        if model_key == "grok":
             url = f"{self.base_url}/v1/videos/generations"
             payload = {
-                "model": "grok-imagine-video",
+                "model": model["api_model"],
                 "prompt": prompt,
-                "aspect_ratio": aspect_ratio,  # "9:16", "16:9", "1:1"
-                "resolution": resolution,      # "720p", "1080p", "480p"
-                "duration": dur_int            # 5, 6, 10
+                "aspect_ratio": cfg["aspect_ratio"],
+                "resolution": cfg["resolution"],
+                "duration": duration_value,
             }
-            try:
-                res = requests.post(url, headers=self.headers, json=payload, timeout=30)
-                if res.status_code == 200:
-                    data = res.json()
-                    req_id = data.get("request_id") or data.get("id")
-                    if req_id:
-                        return True, {
-                            "task_id": req_id,
-                            "endpoint_type": "grok",
-                            "model_key": model_key
-                        }
-                    return False, {"error": f"No request_id returned: {data}"}
-                return False, {"error": f"OpenLux Error {res.status_code}: {res.text}"}
-            except Exception as e:
-                return False, {"error": str(e)}
-
-        # 2. Kling 3.0 Turbo Video (Text-to-Video or Image-to-Video)
-        elif endpoint_type == "kling":
-            if image_url:
-                url = f"{self.base_url}/kling/v1/videos/image2video"
-                payload = {
-                    "model": "kling-3.0-turbo",
-                    "prompt": prompt,
-                    "image": image_url,
-                    "duration": dur_int
-                }
-                mode_type = "kling_i2v"
-            else:
-                url = f"{self.base_url}/kling/v1/videos/text2video"
-                payload = {
-                    "model": "kling-3.0-turbo",
-                    "prompt": prompt,
-                    "duration": dur_int
-                }
-                mode_type = "kling_t2v"
-
-            try:
-                res = requests.post(url, headers=self.headers, json=payload, timeout=30)
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get("code") == 0 and "data" in data and "task_id" in data["data"]:
-                        return True, {
-                            "task_id": data["data"]["task_id"],
-                            "endpoint_type": mode_type,
-                            "model_key": model_key
-                        }
-                    return False, {"error": f"Kling API error: {data}"}
-                return False, {"error": f"Kling Error {res.status_code}: {res.text}"}
-            except Exception as e:
-                return False, {"error": str(e)}
-
+            endpoint_type = "grok"
         else:
-            return False, {"error": f"Unsupported endpoint type '{endpoint_type}'"}
+            sub_path = "image2video" if image_data else "text2video"
+            url = f"{self.base_url}/kling/v1/videos/{sub_path}"
+            payload = {
+                "model": model["api_model"],
+                "prompt": prompt,
+                "duration": duration_value,
+                "aspect_ratio": cfg["aspect_ratio"],
+                "resolution": cfg["resolution"],
+            }
+            if image_data:
+                payload["image"] = image_data
+            endpoint_type = "kling_i2v" if image_data else "kling_t2v"
+
+        try:
+            # POST is not automatically retried: that could create duplicate paid jobs.
+            response = self.session.post(url, headers=self.headers, json=payload, timeout=(10, 45))
+            if response.status_code < 200 or response.status_code >= 300:
+                logger.warning("Generation submission rejected: route=%s status=%s body=%s", model_key, response.status_code, _safe_error(response.text))
+                return False, {"error": "The generation service did not accept the request"}
+
+            data = self._json(response)
+            if model_key == "grok":
+                task_id = data.get("request_id") or data.get("id")
+            else:
+                task_id = data.get("data", {}).get("task_id") if data.get("code") == 0 else None
+            if not task_id:
+                logger.warning("Generation response lacked a task ID: route=%s response=%s", model_key, _safe_error(data))
+                return False, {"error": "The generation service returned an incomplete response"}
+            return True, {"task_id": str(task_id), "endpoint_type": endpoint_type, "settings": cfg}
+        except requests.RequestException as exc:
+            logger.warning("Generation submission network error: %s", _safe_error(exc))
+            return False, {"error": "The generation service is temporarily unreachable"}
+        except (TypeError, ValueError) as exc:
+            logger.warning("Generation submission response error: %s", _safe_error(exc))
+            return False, {"error": str(exc)}
 
     def poll_task_status(self, task_id: str, endpoint_type: str) -> Tuple[str, Optional[str], Optional[str]]:
-        """
-        Poll task status on OpenLux API.
-        Returns (state, media_url, error_message).
-        state can be: 'processing', 'success', 'failed', 'error'
-        """
+        if endpoint_type == "grok":
+            url = f"{self.base_url}/v1/videos/{task_id}"
+        elif endpoint_type in ("kling_t2v", "kling_i2v"):
+            sub_path = "image2video" if endpoint_type == "kling_i2v" else "text2video"
+            url = f"{self.base_url}/kling/v1/videos/{sub_path}/{task_id}"
+        else:
+            return "failed", None, "Unknown generation route"
+
         try:
-            # 1. Grok Video Polling
+            response = self.session.get(url, headers=self.headers, timeout=(10, 30))
+            if response.status_code in (404, 410):
+                return "failed", None, "Generation job was not found"
+            if response.status_code < 200 or response.status_code >= 300:
+                return "error", None, f"Temporary provider response ({response.status_code})"
+            payload = self._json(response)
+
             if endpoint_type == "grok":
-                url = f"{self.base_url}/v1/videos/{task_id}"
-                res = requests.get(url, headers=self.headers, timeout=15)
-                if res.status_code != 200:
-                    return "error", None, f"HTTP {res.status_code}: {res.text}"
-
-                data = res.json()
-                status = data.get("status")
-
-                if status in ["done", "succeed", "completed", "SUCCESS"] or "video" in data or "video_url" in data:
-                    video_dict = data.get("video", {}) if isinstance(data.get("video"), dict) else {}
-                    url_val = video_dict.get("url") or data.get("video_url") or data.get("url")
-                    if url_val and url_val.startswith("http"):
-                        return "success", url_val, None
-                    return "failed", None, f"No video URL found in response: {data}"
-
-                elif status in ["failed", "FAILED", "rejected", "error"]:
-                    err_msg = data.get("error") or data.get("fail_reason") or "Grok generation failed."
-                    return "failed", None, str(err_msg)
-
-                else:
-                    return "processing", None, None
-
-            # 2. Kling Video Polling
-            elif endpoint_type in ["kling_t2v", "kling_i2v"]:
-                sub_path = "image2video" if endpoint_type == "kling_i2v" else "text2video"
-                url = f"{self.base_url}/kling/v1/videos/{sub_path}/{task_id}"
-                res = requests.get(url, headers=self.headers, timeout=15)
-                if res.status_code != 200:
-                    return "error", None, f"HTTP {res.status_code}: {res.text}"
-
-                data_json = res.json()
-                data = data_json.get("data", {})
-                status = data.get("task_status")
-
-                if status == "succeed":
-                    videos = data.get("task_result", {}).get("videos", [])
-                    if videos and isinstance(videos, list) and "url" in videos[0]:
-                        return "success", videos[0]["url"], None
-                    return "failed", None, f"No Kling video URL found: {data_json}"
-
-                elif status in ["failed", "FAILED"]:
-                    err_msg = data.get("task_status_msg") or "Kling video generation failed."
-                    return "failed", None, str(err_msg)
-
-                else:
-                    return "processing", None, None
-
+                status = str(payload.get("status", "")).lower()
+                video = payload.get("video") if isinstance(payload.get("video"), dict) else {}
+                media_url = video.get("url") or payload.get("video_url") or payload.get("url")
             else:
-                return "error", None, f"Unknown polling endpoint type '{endpoint_type}'"
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                status = str(data.get("task_status", "")).lower()
+                videos = data.get("task_result", {}).get("videos", [])
+                media_url = videos[0].get("url") if videos and isinstance(videos[0], dict) else None
 
-        except Exception as e:
-            return "error", None, str(e)
+            if status in ("done", "succeed", "completed", "success"):
+                if isinstance(media_url, str) and media_url.startswith(("https://", "http://")):
+                    return "success", media_url, None
+                return "failed", None, "Completed job did not include a video"
+            if status in ("failed", "rejected", "error", "cancelled", "canceled"):
+                return "failed", None, "The video could not be generated"
+            return "processing", None, None
+        except requests.RequestException as exc:
+            return "error", None, _safe_error(exc)
+        except (TypeError, ValueError) as exc:
+            return "error", None, _safe_error(exc)
+
+    def download_video(self, media_url: str) -> str:
+        """Download a completed result with a hard byte limit and return a temp path."""
+        headers = self.headers if media_url.startswith(self.base_url) else {}
+        path = ""
+        try:
+            with self.session.get(media_url, headers=headers, stream=True, timeout=(10, 120)) as response:
+                response.raise_for_status()
+                declared_size = int(response.headers.get("content-length", "0") or 0)
+                if declared_size > MAX_VIDEO_BYTES:
+                    raise ValueError("Generated video is too large for Telegram delivery")
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as output:
+                    path = output.name
+                    total = 0
+                    for chunk in response.iter_content(chunk_size=128 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_VIDEO_BYTES:
+                            raise ValueError("Generated video is too large for Telegram delivery")
+                        output.write(chunk)
+            return path
+        except Exception:
+            if path and os.path.exists(path):
+                os.unlink(path)
+            raise

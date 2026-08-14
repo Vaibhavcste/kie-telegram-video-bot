@@ -4,5 +4,7 @@ __pycache__/
 *.pyc
 .env
 user_settings.json
+generation_history.json
+pending_jobs.json
 *.log
 scratch/
