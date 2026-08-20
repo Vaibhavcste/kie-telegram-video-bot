@@ -47,6 +47,11 @@ pm2 start ecosystem.config.cjs
 pm2 logs kie-telegram-video-bot
 ```
 
+For an isolated AbhiBots-backed instance, set `VIDEO_PROVIDER=abhibots` and
+provide `ABHIBOTS_API_KEY` instead of `OPENLUX_API_KEY`. Keep each Telegram bot
+in a separate service with its own `TELEGRAM_BOT_TOKEN` and persistent data
+directory.
+
 ## Commands
 
 - `/start`, `/help` — usage and current output preset
