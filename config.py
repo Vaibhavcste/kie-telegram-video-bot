@@ -18,8 +18,14 @@ def _csv_user_ids(name: str) -> list[int]:
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+VIDEO_PROVIDER = os.getenv("VIDEO_PROVIDER", "openlux").strip().lower()
 OPENLUX_API_KEY = os.getenv("OPENLUX_API_KEY", "").strip()
 OPENLUX_BASE_URL = os.getenv("OPENLUX_BASE_URL", "https://api.openlux.ai").strip()
+ABHIBOTS_API_KEY = os.getenv("ABHIBOTS_API_KEY", "").strip()
+ABHIBOTS_BASE_URL = os.getenv("ABHIBOTS_BASE_URL", "https://vgen.abhibots.com").strip()
+
+if VIDEO_PROVIDER not in {"openlux", "abhibots"}:
+    raise ValueError("VIDEO_PROVIDER must be either 'openlux' or 'abhibots'")
 
 # Access is deliberately fail-closed. A missing allowlist never makes the bot public.
 ALLOWED_USER_IDS = _csv_user_ids("ALLOWED_USER_IDS")
@@ -54,13 +60,13 @@ MODELS = {
 }
 
 SETTING_OPTIONS = {
-    "duration": ["5", "6", "10"],
+    "duration": ["5", "6", "10", "15"] if VIDEO_PROVIDER == "abhibots" else ["5", "6", "10"],
     "aspect_ratio": ["9:16", "16:9", "1:1"],
     "resolution": ["480p", "720p", "1080p"],
 }
 
 DEFAULT_USER_SETTINGS = {
-    "duration": "5",
+    "duration": "6" if VIDEO_PROVIDER == "abhibots" else "5",
     "aspect_ratio": "9:16",
     "resolution": "480p",
 }
@@ -86,8 +92,10 @@ def validate_runtime_config() -> list[str]:
     missing = []
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
-    if not OPENLUX_API_KEY:
+    if VIDEO_PROVIDER == "openlux" and not OPENLUX_API_KEY:
         missing.append("OPENLUX_API_KEY")
+    if VIDEO_PROVIDER == "abhibots" and not ABHIBOTS_API_KEY:
+        missing.append("ABHIBOTS_API_KEY")
     if not ALLOWED_USER_IDS:
         missing.append("ALLOWED_USER_IDS")
     return missing

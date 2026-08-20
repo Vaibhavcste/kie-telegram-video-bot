@@ -12,7 +12,10 @@ from typing import Any, Optional
 import telebot
 from telebot.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from abhibots_client import AbhiBotsClient
 from config import (
+    ABHIBOTS_API_KEY,
+    ABHIBOTS_BASE_URL,
     ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
     DEFAULT_USER_SETTINGS,
@@ -26,6 +29,7 @@ from config import (
     POLL_INTERVAL_SECONDS,
     SETTING_OPTIONS,
     TELEGRAM_BOT_TOKEN,
+    VIDEO_PROVIDER,
     normalized_settings,
     validate_runtime_config,
 )
@@ -46,7 +50,11 @@ user_settings: dict[int, dict[str, str]] = {}
 generation_history: list[dict[str, Any]] = []
 active_jobs: dict[int, int] = {}
 
-openlux_client = OpenLuxClient(api_key=OPENLUX_API_KEY, base_url=OPENLUX_BASE_URL)
+generation_client = (
+    AbhiBotsClient(api_key=ABHIBOTS_API_KEY, base_url=ABHIBOTS_BASE_URL)
+    if VIDEO_PROVIDER == "abhibots"
+    else OpenLuxClient(api_key=OPENLUX_API_KEY, base_url=OPENLUX_BASE_URL)
+)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="Markdown") if TELEGRAM_BOT_TOKEN else None
 bot_username = ""
 
@@ -429,7 +437,7 @@ def handle_generation_request(
         return
 
     route = "kling" if image_data else "grok"
-    settings = normalized_settings(get_user_config(user_id), route=route)
+    settings = generation_client.normalize_settings(get_user_config(user_id), route)
     status_text = (
         "🎬 *Video request accepted*\n\n"
         f"• *Prompt:* `{escape_markdown(prompt[:500])}`\n"
@@ -466,7 +474,7 @@ def _worker_generation_task(
 ) -> None:
     operation = "photo" if image_data else "text"
     try:
-        ok, result = openlux_client.create_generation_task(
+        ok, result = generation_client.create_generation_task(
             model_key=route,
             prompt=prompt,
             duration=settings["duration"],
@@ -489,13 +497,13 @@ def _worker_generation_task(
         consecutive_poll_errors = 0
 
         while time.monotonic() - started_at <= GENERATION_TIMEOUT_SECONDS:
-            state, media_url, error = openlux_client.poll_task_status(task_id, endpoint_type)
+            state, media_url, error = generation_client.poll_task_status(task_id, endpoint_type)
             elapsed = int(time.monotonic() - started_at)
             if state == "success" and media_url:
                 safe_edit_message_text("✅ *Video ready.* Preparing delivery…", chat_id, message_id)
                 temp_path = ""
                 try:
-                    temp_path = openlux_client.download_video(media_url)
+                    temp_path = generation_client.download_video(media_url)
                     with open(temp_path, "rb") as video_file:
                         bot.send_video(chat_id, video_file, caption=format_caption(prompt, settings), supports_streaming=True, timeout=120)
                     log_generation_event(user_id, prompt, operation, settings, "success")
@@ -545,7 +553,7 @@ def main() -> None:
         bot_username = bot.get_me().username or ""
     except Exception as exc:
         logger.warning("Telegram authentication check failed; polling will retry: %s", exc)
-    logger.info("Starting Team Video Studio for %d allowed users", len(ALLOWED_USER_IDS))
+    logger.info("Starting Team Video Studio for %d allowed users using %s", len(ALLOWED_USER_IDS), VIDEO_PROVIDER)
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
 
 

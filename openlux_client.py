@@ -46,6 +46,10 @@ class OpenLuxClient:
         }
 
     @staticmethod
+    def normalize_settings(settings: dict[str, Any], route: str) -> dict[str, str]:
+        return normalized_settings(settings, route=route)
+
+    @staticmethod
     def _json(response: requests.Response) -> dict[str, Any]:
         try:
             data = response.json()
