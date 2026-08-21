@@ -67,6 +67,7 @@ class OpenLuxClient:
         aspect_ratio: str = "9:16",
         resolution: str = "720p",
         image_data: Optional[str] = None,
+        sound: bool = False,
     ) -> Tuple[bool, dict[str, Any]]:
         if model_key not in MODELS:
             return False, {"error": "Unsupported generation route"}

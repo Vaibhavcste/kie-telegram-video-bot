@@ -10,12 +10,13 @@ import time
 from typing import Any, Optional
 
 import telebot
-from telebot.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telebot.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from abhibots_client import AbhiBotsClient
 from config import (
     ABHIBOTS_API_KEY,
     ABHIBOTS_BASE_URL,
+    ABHIBOTS_MODELS,
     ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
     DEFAULT_USER_SETTINGS,
@@ -112,7 +113,13 @@ def get_user_config(user_id: int) -> dict[str, str]:
 
 
 def update_user_setting(user_id: int, key: str, value: str) -> bool:
-    if key not in SETTING_OPTIONS or value not in SETTING_OPTIONS[key]:
+    allowed = SETTING_OPTIONS.get(key, [])
+    if VIDEO_PROVIDER == "abhibots":
+        current = get_user_config(user_id)
+        model = ABHIBOTS_MODELS[current["model"]]
+        fields = {"duration": "durations", "aspect_ratio": "aspect_ratios", "resolution": "resolutions"}
+        allowed = model.get(fields.get(key, ""), [])
+    if key not in SETTING_OPTIONS or value not in allowed:
         return False
     with settings_lock:
         current = normalized_settings(user_settings.get(user_id, {}))
@@ -120,6 +127,29 @@ def update_user_setting(user_id: int, key: str, value: str) -> bool:
         user_settings[user_id] = current
         _write_json_atomic(USER_SETTINGS_FILE, user_settings)
     return True
+
+
+def update_user_model(user_id: int, model_key: str) -> bool:
+    if VIDEO_PROVIDER != "abhibots" or model_key not in ABHIBOTS_MODELS:
+        return False
+    with settings_lock:
+        current = normalized_settings(user_settings.get(user_id, {}), route=model_key)
+        user_settings[user_id] = current
+        _write_json_atomic(USER_SETTINGS_FILE, user_settings)
+    return True
+
+
+def toggle_user_sound(user_id: int) -> bool:
+    if VIDEO_PROVIDER != "abhibots":
+        return False
+    with settings_lock:
+        current = normalized_settings(user_settings.get(user_id, {}))
+        if not ABHIBOTS_MODELS[current["model"]].get("supports_sound"):
+            return False
+        current["sound"] = not current.get("sound", False)
+        user_settings[user_id] = current
+        _write_json_atomic(USER_SETTINGS_FILE, user_settings)
+        return current["sound"]
 
 
 def load_history() -> None:
@@ -138,6 +168,7 @@ def log_generation_event(user_id: int, prompt: str, operation: str, settings: di
         "duration": settings["duration"],
         "aspect_ratio": settings["aspect_ratio"],
         "resolution": settings["resolution"],
+        "model": settings.get("model") if VIDEO_PROVIDER == "abhibots" else None,
         "status": status,
     }
     with history_lock:
@@ -159,7 +190,10 @@ def format_settings(settings: dict[str, str]) -> str:
 
 def format_caption(prompt: str, settings: dict[str, str]) -> str:
     clean_prompt = escape_markdown(prompt[:700] + ("…" if len(prompt) > 700 else ""))
-    return f"🎬 *Prompt:* {clean_prompt}\n⚙️ *Output:* `{format_settings(settings)}`"
+    model_line = ""
+    if VIDEO_PROVIDER == "abhibots" and settings.get("model") in ABHIBOTS_MODELS:
+        model_line = f"\n🤖 *Model:* {escape_markdown(ABHIBOTS_MODELS[settings['model']]['name'])}"
+    return f"🎬 *Prompt:* {clean_prompt}{model_line}\n⚙️ *Output:* `{format_settings(settings)}`"
 
 
 def is_user_allowed(user_id: int) -> bool:
@@ -214,10 +248,10 @@ def safe_edit_message_text(text: str, chat_id: int, message_id: int, reply_marku
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-        InlineKeyboardButton("📊 History", callback_data="menu_history"),
-    )
+    markup.row(InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
+               InlineKeyboardButton("📊 History", callback_data="menu_history"))
+    if VIDEO_PROVIDER == "abhibots":
+        markup.add(InlineKeyboardButton("🤖 Select Video Model", callback_data="menu_models"))
     markup.add(InlineKeyboardButton("ℹ️ Help", callback_data="menu_info"))
     return markup
 
@@ -225,37 +259,71 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
 def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     settings = get_user_config(user_id)
     markup = InlineKeyboardMarkup()
+    if VIDEO_PROVIDER == "abhibots":
+        model = ABHIBOTS_MODELS[settings["model"]]
+        markup.add(InlineKeyboardButton(f"🤖 Model: {model['name']}", callback_data="menu_models"))
     markup.add(InlineKeyboardButton(f"⏱️ Duration: {settings['duration']}s", callback_data="menu_durations"))
     markup.add(InlineKeyboardButton(f"📐 Format: {settings['aspect_ratio']}", callback_data="menu_ratios"))
     markup.add(InlineKeyboardButton(f"🖥️ Quality: {settings['resolution']}", callback_data="menu_resolutions"))
+    if VIDEO_PROVIDER == "abhibots" and model.get("supports_sound"):
+        sound_label = "🔊 Sound: ON" if settings.get("sound") else "🔇 Sound: OFF"
+        markup.add(InlineKeyboardButton(sound_label, callback_data="toggle_sound"))
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
     return markup
 
 
-def _options_keyboard(kind: str, current: str) -> InlineKeyboardMarkup:
+def _options_keyboard(kind: str, current: str, model_key: Optional[str] = None) -> InlineKeyboardMarkup:
     labels = {"duration": " sec", "aspect_ratio": "", "resolution": ""}
     callback_names = {"duration": "set_duration", "aspect_ratio": "set_ratio", "resolution": "set_resolution"}
     markup = InlineKeyboardMarkup()
+    options = SETTING_OPTIONS[kind]
+    if VIDEO_PROVIDER == "abhibots" and model_key in ABHIBOTS_MODELS:
+        field = {"duration": "durations", "aspect_ratio": "aspect_ratios", "resolution": "resolutions"}[kind]
+        options = ABHIBOTS_MODELS[model_key][field]
     buttons = [
         InlineKeyboardButton(
             f"{'✅ ' if value == current else ''}{value}{labels[kind]}",
             callback_data=f"{callback_names[kind]}:{value}",
         )
-        for value in SETTING_OPTIONS[kind]
+        for value in options
     ]
     markup.row(*buttons)
     markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_settings"))
     return markup
 
 
+def get_models_keyboard(current_model: str) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=1)
+    for model_key, model in ABHIBOTS_MODELS.items():
+        prefix = "✅ " if model_key == current_model else ""
+        capabilities = "Text + Photo" if model.get("supports_image") else "Text"
+        markup.add(InlineKeyboardButton(f"{prefix}{model['name']} · {capabilities}", callback_data=f"set_model:{model_key}"))
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_settings"))
+    return markup
+
+
 def settings_text(settings: dict[str, str]) -> str:
+    model_line = ""
+    sound_line = ""
+    if VIDEO_PROVIDER == "abhibots":
+        model = ABHIBOTS_MODELS[settings["model"]]
+        model_line = f"• *Model:* `{escape_markdown(model['name'])}`\n"
+        if model.get("supports_sound"):
+            sound_line = f"• *Sound:* `{'ON' if settings.get('sound') else 'OFF'}`\n"
+    photo_note = (
+        "Photo uploads use the selected model when it supports images; "
+        "otherwise they safely use Seedance 2.0."
+        if VIDEO_PROVIDER == "abhibots"
+        else "Photo uploads automatically use a compatible animation route."
+    )
     return (
         "⚙️ *Video Settings*\n\n"
-        f"• *Duration:* `{settings['duration']} seconds`\n"
-        f"• *Format:* `{settings['aspect_ratio']}`\n"
-        f"• *Quality:* `{settings['resolution']}`\n\n"
-        "Photo animation automatically uses the best compatible rendering route. "
-        "If a chosen option is unavailable for a photo, the bot safely uses the nearest compatible preset."
+        + model_line
+        + f"• *Duration:* `{settings['duration']} seconds`\n"
+        + f"• *Format:* `{settings['aspect_ratio']}`\n"
+        + f"• *Quality:* `{settings['resolution']}`\n"
+        + sound_line
+        + f"\n{photo_note}"
     )
 
 
@@ -269,6 +337,8 @@ def history_text() -> str:
         for item in reversed(recent):
             icon = "✅" if item.get("status") == "success" else "❌"
             operation = "Photo animation" if item.get("operation") == "photo" else "Text video"
+            if VIDEO_PROVIDER == "abhibots" and item.get("model") in ABHIBOTS_MODELS:
+                operation = ABHIBOTS_MODELS[item["model"]]["name"]
             prompt = escape_markdown(item.get("prompt", ""))[:45]
             text += f"{icon} *{operation}* ({item.get('duration', '?')}s)\n  └ `{prompt}…` [{item.get('timestamp', '')}]\n"
         return text
@@ -284,11 +354,20 @@ if bot:
         if not check_access(message):
             return
         settings = get_user_config(message.from_user.id)
+        model_line = ""
+        if VIDEO_PROVIDER == "abhibots":
+            model_line = f"🤖 *Selected model:* `{escape_markdown(ABHIBOTS_MODELS[settings['model']]['name'])}`\n"
+        controls_hint = (
+            "Use /models to choose the video model and /settings for its compatible controls."
+            if VIDEO_PROVIDER == "abhibots"
+            else "Use /settings to change duration, format, or quality."
+        )
         text = (
             "🎥 *Team Video Studio*\n\n"
             "Create a video by sending a detailed text prompt, or animate a photo by sending it with a caption.\n\n"
+            f"{model_line}"
             f"⚙️ *Current output:* `{format_settings(settings)}`\n\n"
-            "Use /settings to change duration, format, or quality."
+            f"{controls_hint}"
         )
         bot.send_message(message.chat.id, text, reply_markup=get_main_keyboard())
 
@@ -297,6 +376,17 @@ if bot:
         if check_access(message):
             settings = get_user_config(message.from_user.id)
             bot.send_message(message.chat.id, settings_text(settings), reply_markup=get_settings_keyboard(message.from_user.id))
+
+    @bot.message_handler(commands=["models"])
+    def cmd_models(message: Message):
+        if not check_access(message):
+            return
+        if VIDEO_PROVIDER != "abhibots":
+            bot.send_message(message.chat.id, "ℹ️ Rendering routes are selected automatically for this bot.")
+            return
+        settings = get_user_config(message.from_user.id)
+        bot.send_message(message.chat.id, "🤖 *Choose a video model:*",
+                         reply_markup=get_models_keyboard(settings["model"]))
 
     @bot.message_handler(commands=["generate"])
     def cmd_generate(message: Message):
@@ -346,7 +436,7 @@ if bot:
             image_bytes = bot.download_file(file_info.file_path)
             if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
                 raise ValueError("Photo is too large")
-            # Kling-compatible APIs expect raw Base64 in the image field (no data-URI prefix).
+            # Provider adapters receive raw Base64 and choose their secure upload transport.
             image_data = base64.b64encode(image_bytes).decode("ascii")
             handle_generation_request(
                 message.chat.id,
@@ -386,7 +476,10 @@ if bot:
         markup = None
         text = ""
         if data == "menu_main":
-            text = f"🎥 *Team Video Studio*\n\n⚙️ *Current output:* `{format_settings(settings)}`"
+            model_line = ""
+            if VIDEO_PROVIDER == "abhibots":
+                model_line = f"🤖 *Model:* `{escape_markdown(ABHIBOTS_MODELS[settings['model']]['name'])}`\n"
+            text = f"🎥 *Team Video Studio*\n\n{model_line}⚙️ *Current output:* `{format_settings(settings)}`"
             markup = get_main_keyboard()
         elif data == "menu_settings":
             text, markup = settings_text(settings), get_settings_keyboard(call.from_user.id)
@@ -395,15 +488,35 @@ if bot:
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
         elif data == "menu_info":
-            text = "ℹ️ *How it works*\n\nSend text to create a new video. Send a photo with a caption to animate it. Rendering routes are selected automatically."
+            model_help = (
+                " Use /models to choose the rendering model. Only compatible settings are shown."
+                if VIDEO_PROVIDER == "abhibots"
+                else " Rendering routes are selected automatically."
+            )
+            text = f"ℹ️ *How it works*\n\nSend text to create a new video. Send a photo with a caption to animate it.{model_help}"
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
+        elif data == "menu_models" and VIDEO_PROVIDER == "abhibots":
+            text, markup = "🤖 *Choose a video model:*", get_models_keyboard(settings["model"])
+        elif data.startswith("set_model:") and VIDEO_PROVIDER == "abhibots":
+            model_key = data.split(":", 1)[1]
+            if not update_user_model(call.from_user.id, model_key):
+                bot.answer_callback_query(call.id, "Invalid model", show_alert=True)
+                return
+            settings = get_user_config(call.from_user.id)
+            text = f"✅ *Model selected:* {escape_markdown(ABHIBOTS_MODELS[model_key]['name'])}\n\n" + settings_text(settings)
+            markup = get_settings_keyboard(call.from_user.id)
+        elif data == "toggle_sound" and VIDEO_PROVIDER == "abhibots":
+            enabled = toggle_user_sound(call.from_user.id)
+            settings = get_user_config(call.from_user.id)
+            text = f"✅ *Sound:* {'ON' if enabled else 'OFF'}\n\n" + settings_text(settings)
+            markup = get_settings_keyboard(call.from_user.id)
         elif data == "menu_durations":
-            text, markup = "⏱️ *Select duration:*", _options_keyboard("duration", settings["duration"])
+            text, markup = "⏱️ *Select duration:*", _options_keyboard("duration", settings["duration"], settings.get("model"))
         elif data == "menu_ratios":
-            text, markup = "📐 *Select format:*", _options_keyboard("aspect_ratio", settings["aspect_ratio"])
+            text, markup = "📐 *Select format:*", _options_keyboard("aspect_ratio", settings["aspect_ratio"], settings.get("model"))
         elif data == "menu_resolutions":
-            text, markup = "🖥️ *Select quality:*", _options_keyboard("resolution", settings["resolution"])
+            text, markup = "🖥️ *Select quality:*", _options_keyboard("resolution", settings["resolution"], settings.get("model"))
         else:
             callback_map = {"set_duration": "duration", "set_ratio": "aspect_ratio", "set_resolution": "resolution"}
             prefix, separator, value = data.partition(":")
@@ -436,11 +549,24 @@ def handle_generation_request(
             bot.send_message(chat_id, text)
         return
 
-    route = "kling" if image_data else "grok"
-    settings = generation_client.normalize_settings(get_user_config(user_id), route)
+    user_config = get_user_config(user_id)
+    if VIDEO_PROVIDER == "abhibots":
+        route = user_config["model"]
+        if image_data and not ABHIBOTS_MODELS[route].get("supports_image"):
+            route = "seedance2"
+    else:
+        route = "kling" if image_data else "grok"
+    settings = generation_client.normalize_settings(user_config, route)
+    model_line = ""
+    route_notice = ""
+    if VIDEO_PROVIDER == "abhibots":
+        model_line = f"• *Model:* `{escape_markdown(ABHIBOTS_MODELS[route]['name'])}`\n"
+        if image_data and route != user_config["model"]:
+            route_notice = "ℹ️ The selected model does not support photos, so this animation will use a compatible video model.\n\n"
     status_text = (
-        "🎬 *Video request accepted*\n\n"
+        f"{route_notice}🎬 *Video request accepted*\n\n"
         f"• *Prompt:* `{escape_markdown(prompt[:500])}`\n"
+        f"{model_line}"
         f"• *Output:* `{format_settings(settings)}`\n"
         f"• *Source:* `{'Attached photo' if image_data else 'Text prompt'}`\n\n"
         "⏳ Rendering has started."
@@ -481,6 +607,7 @@ def _worker_generation_task(
             aspect_ratio=settings["aspect_ratio"],
             resolution=settings["resolution"],
             image_data=image_data,
+            sound=bool(settings.get("sound", False)),
         )
         image_data = None
         if not ok:
@@ -553,7 +680,25 @@ def main() -> None:
         bot_username = bot.get_me().username or ""
     except Exception as exc:
         logger.warning("Telegram authentication check failed; polling will retry: %s", exc)
-    logger.info("Starting Team Video Studio for %d allowed users using %s", len(ALLOWED_USER_IDS), VIDEO_PROVIDER)
+    try:
+        commands = [
+            BotCommand("start", "Open Team Video Studio"),
+            BotCommand("settings", "Change video output settings"),
+            BotCommand("generate", "Generate a video from a prompt"),
+            BotCommand("history", "View recent team generations"),
+            BotCommand("id", "Show your Telegram user ID"),
+        ]
+        if VIDEO_PROVIDER == "abhibots":
+            commands.insert(1, BotCommand("models", "Choose a video model"))
+        bot.set_my_commands(commands)
+    except Exception as exc:
+        logger.warning("Could not register Telegram command menu: %s", exc)
+    logger.info(
+        "Starting @%s for %d allowed users using %s",
+        bot_username or "unknown",
+        len(ALLOWED_USER_IDS),
+        VIDEO_PROVIDER,
+    )
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
 
 

@@ -1,14 +1,20 @@
 # Team Video Studio Telegram Bot
 
-A private Telegram bot for creating short AI videos from text prompts and animating uploaded photos. The Telegram experience is intentionally provider-neutral: team members choose only duration, format, and output quality. Provider names, account balances, wholesale pricing, credentials, and raw API errors stay on the server.
+A private Telegram bot for creating short AI videos from text prompts and animating uploaded photos. AbhiBots deployments expose a capability-aware video-model selector; OpenLux deployments route internally. Account balances, wholesale pricing, credentials, and raw API errors stay on the server.
 
 ## User experience
 
 - Send a text prompt to create a video.
 - Send a photo with a caption to animate it.
+- On AbhiBots deployments, use `/models` to choose among nine supported video engines.
 - Use `/settings` to choose duration, aspect ratio, and quality.
 - Use `/history` to view recent team jobs without provider or billing details.
-- Text and photo requests are routed automatically to compatible rendering backends.
+- Text and photo requests are validated and routed only to compatible rendering endpoints.
+
+The AbhiBots selector includes xAI Grok Video 1.5, ByteDance Seedance 1.5 Pro,
+ByteDance Seedance 2.0, Google Veo 3, Google Veo 3 Fast, Runway Gen-4,
+Kuaishou Kling 2.6, MiniMax Hailuo 02, and Google Gemini Omni Video. Account
+and billing details are never shown in Telegram.
 
 ## Reliability and security
 
@@ -55,6 +61,7 @@ directory.
 ## Commands
 
 - `/start`, `/help` — usage and current output preset
+- `/models` — choose a video model on AbhiBots deployments
 - `/settings` — duration, format, and quality controls
 - `/generate <prompt>` — explicit generation command, useful in groups
 - `/history`, `/usage` — recent team generation activity
@@ -65,7 +72,7 @@ directory.
 
 - Rotate every credential that has ever appeared in repository history, documentation, chat, or logs.
 - Keep `.env`, `user_settings.json`, and `generation_history.json` outside source control and on persistent storage.
-- Configure Telegram's BotFather command list without provider, model, balance, or pricing commands if you want them absent from command suggestions.
+- The bot registers its safe command list with Telegram at startup; balance and pricing commands are never registered.
 - The current local JSON state is suitable for a small internal team. Before public resale, replace it with a transactional database and durable job queue, add tenant isolation and quotas, and deliver completed jobs from a worker process.
 
 Run checks with:
